@@ -33,6 +33,8 @@ return agent(prompt("Summarize these reports:\n\n{reports}", { reports }));
 
 Launch with a non-empty `name` and exactly one of `script` or `scriptPath`. Registered functions are available as globals, and JSON-compatible launch values are available through `args`. Runs are backgrounded by default; set `foreground: true` to wait for the final value.
 
+For shell tasks with output exceeding the 10 MB JSON RPC limit, `shell(command, { artifact: true })` streams stdout/stderr to content-addressed evidence storage and returns a compact reference (`res.stdoutEvidence`) readable in bounded pages via `tools.read({ path, offset, limit })`.
+
 ## Programmatic integration
 
 The package exports the workflow registry, runtime, persistence, validation, settings, generic agent preparation, lifecycle, and local Pi session APIs used by trusted hosts and extensions.

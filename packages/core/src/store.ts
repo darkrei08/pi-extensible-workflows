@@ -834,6 +834,33 @@ export class RunStore {
     return record;
   }
 
+  /** Takes a streamed temporary file and commits it into the evidence store with checksum verification. */
+  async saveEvidenceFile(tempPath: string, sha256: string, bytes: number): Promise<EvidenceRecord> {
+    const ref = `ref:sha256:${sha256.slice(0, 16)}`;
+    const operation = structuralPath("evidence", sha256);
+    const replayed = await this.replay(operation);
+    if (replayed) {
+      const value = replayed.value;
+      if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== bytes || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt`) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
+      assertEvidenceIntegrity(await readFile(value.path), sha256, value.path);
+      await rm(tempPath, { force: true }).catch(() => undefined);
+      return { ref, sha256, path: value.path, bytes };
+    }
+    const dir = this.evidenceDirectory();
+    const targetPath = join(dir, `${sha256}.txt`);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const existing = await readFile(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
+    if (existing !== undefined) {
+      assertEvidenceIntegrity(existing, sha256, targetPath);
+      await rm(tempPath, { force: true }).catch(() => undefined);
+    } else {
+      await rename(tempPath, targetPath);
+    }
+    const record = { ref, sha256, path: targetPath, bytes };
+    await this.updateJournal((journal) => { journal.completed[operation] ??= { path: operation, value: record }; });
+    return record;
+  }
+
   async listEvidence(): Promise<readonly EvidenceRecord[]> {
     const dir = this.evidenceDirectory();
     const names = await readdir(dir).catch(() => [] as string[]);

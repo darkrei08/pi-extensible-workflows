@@ -20,3 +20,8 @@ void test("reserved instrumentation identifiers are rejected by one guard shared
   assert.equal((source.match(/assertNoReservedIdentifiers\(program\)/g) ?? []).length, 2, "instrumentWorkflow() and preflight() must both call the guard");
   assert.doesNotMatch(source, /function staticRoleName\(/, "staticRoleName duplicated staticString");
 });
+
+void test("SHELL_OPTION_KEYS includes artifact and artifactThresholdBytes", () => {
+  const source = readFileSync(validationPath, "utf8");
+  assert.match(source, /const SHELL_OPTION_KEYS = new Set\(\[[^\]]*"artifact"[^\]]*"artifactThresholdBytes"[^\]]*\]\);/);
+});

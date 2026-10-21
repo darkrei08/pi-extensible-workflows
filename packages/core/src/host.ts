@@ -562,11 +562,16 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     try {
       const path = shellIdentityPath(identity);
       const replayed = await store.replay(path);
-      if (replayed) return readShellResult(replayed.value);
+      if (replayed) {
+        const replayedResult = readShellResult(replayed.value);
+        if (replayedResult.stdoutEvidence && !existsSync(replayedResult.stdoutEvidence.path)) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence artifact is missing: ${replayedResult.stdoutEvidence.path}`);
+        if (replayedResult.stderrEvidence && !existsSync(replayedResult.stderrEvidence.path)) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence artifact is missing: ${replayedResult.stderrEvidence.path}`);
+        return replayedResult;
+      }
       const shellStartedAt = Date.now();
       let shellPhaseIndex = -1;
       // Env values stay out of the record: they may carry secrets, and a shared trajectory publishes run state.
-      const call: WorkflowScriptCall = { kind: "shell", name: "shell", path, ...scriptCallInput({ command, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.env === undefined ? {} : { env: Object.keys(options.env) }), ...(identity.worktreeOwner ? { worktree: identity.worktreeOwner } : {}) }), startedAt: shellStartedAt };
+      const call: WorkflowScriptCall = { kind: "shell", name: "shell", path, ...scriptCallInput({ command, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.env === undefined ? {} : { env: Object.keys(options.env) }), ...(options.artifact === undefined ? {} : { artifact: options.artifact }), ...(options.artifactThresholdBytes === undefined ? {} : { artifactThresholdBytes: options.artifactThresholdBytes }), ...(identity.worktreeOwner ? { worktree: identity.worktreeOwner } : {}) }), startedAt: shellStartedAt };
       let failure: WorkflowError | undefined;
       const started = await persistRunState(store, metadata, (run) => {
         const current = startScriptCall(run, call);
@@ -583,7 +588,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(started)));
       try {
         const cwd = identity.worktreeOwner ? (await persistWorktree(store, metadata, identity.worktreeOwner)).cwd : store.cwd;
-        const result = await executeShellCommand(command, options, signal, cwd);
+        const result = await executeShellCommand(command, options, signal, cwd, store);
         if (!jsonValue(result)) fail("SHELL_FAILED", "Shell result is not JSON-compatible");
         await store.complete(path, result);
         return result;

@@ -330,15 +330,22 @@ export function validateAgentOptions(value: unknown): Readonly<Record<string, Js
   for (const [key, option] of Object.entries(value)) if (AGENT_OPTION_KEYS.has(key)) validateAgentOption(key, option);
   return value;
 }
-const SHELL_OPTION_KEYS = new Set(["timeoutMs", "env"]);
+const SHELL_OPTION_KEYS = new Set(["timeoutMs", "env", "artifact", "artifactThresholdBytes"]);
 function isStringRecord(value: unknown): value is Record<string, string> { return object(value) && Object.values(value).every((entry) => typeof entry === "string"); }
 export function validateShellOptions(value: unknown): ShellOptions {
   if (value === undefined) return {};
-  if (!object(value) || !jsonValue(value) || Object.keys(value).some((key) => !SHELL_OPTION_KEYS.has(key))) fail("INVALID_METADATA", "shell options must contain only timeoutMs and env");
+  if (!object(value) || !jsonValue(value) || Object.keys(value).some((key) => !SHELL_OPTION_KEYS.has(key))) fail("INVALID_METADATA", "shell options must contain only timeoutMs, env, artifact, and artifactThresholdBytes");
   if (value.timeoutMs !== undefined && !positiveInteger(value.timeoutMs)) fail("INVALID_METADATA", "shell timeoutMs must be a positive integer");
   const env = value.env;
   if (env !== undefined && !isStringRecord(env)) fail("INVALID_METADATA", "shell env must be an object of strings");
-  return { ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }), ...(env === undefined ? {} : { env }) };
+  if (value.artifact !== undefined && typeof value.artifact !== "boolean" && !positiveInteger(value.artifact)) fail("INVALID_METADATA", "shell artifact must be a boolean or positive integer");
+  if (value.artifactThresholdBytes !== undefined && !positiveInteger(value.artifactThresholdBytes)) fail("INVALID_METADATA", "shell artifactThresholdBytes must be a positive integer");
+  return {
+    ...(value.timeoutMs === undefined ? {} : { timeoutMs: value.timeoutMs }),
+    ...(env === undefined ? {} : { env }),
+    ...(value.artifact === undefined ? {} : { artifact: value.artifact }),
+    ...(value.artifactThresholdBytes === undefined ? {} : { artifactThresholdBytes: value.artifactThresholdBytes }),
+  };
 }
 export function validateShellCommand(value: unknown): string {
   if (typeof value !== "string") fail("INVALID_METADATA", "shell command must be a string");

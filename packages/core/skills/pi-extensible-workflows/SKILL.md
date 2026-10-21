@@ -38,6 +38,8 @@ Call `workflow_catalog` once to list functions and model aliases before the firs
 
 Workflow JavaScript has no imports, filesystem, network, process, or timers. Delegate that work to agents. `shell(command, options)` is the trusted host RPC for deterministic gates: it inherits the workflow or active-worktree cwd, merges string `env` overrides, and returns `{ exitCode, stdout, stderr }`; nonzero exits are results, but launch failures and timeouts fail with `SHELL_FAILED`.
 
+When output can exceed the 10 MB JSON RPC boundary, pass `{ artifact: true }` (or `{ artifactThresholdBytes: N }`). Large commands stream stdout/stderr into the evidence store and return a compact record with `exitCode`, byte metadata (`stdoutBytes`, `stderrBytes`), and evidence references (`stdoutEvidence`, `stderrEvidence`, `evidence`), while small results remain standard strings. Workflows or child agents inspect large evidence artifacts in bounded pages using `await tools.read({ path: res.stdoutEvidence.path, offset, limit })`.
+
 `await tools.<name>(args)` calls a tool of the launching Pi session directly, without an agent, with the same names and results as Pi `codemode`: an object when the tool declares an output schema, otherwise its text; other failures reject with `TOOL_FAILED`. Do not probe with `"name" in tools`; the launch checks the names a script calls. Prefer it over an agent for mechanical reads and tool calls. Workflow and subagent tools are not callable, and calls inside `withWorktree` fail.
 
 `await evidence(content)` explicitly stores text or JSON and returns `{ ref, sha256, path, bytes }`.

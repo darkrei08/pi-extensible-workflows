@@ -983,3 +983,30 @@ void test("concurrent identical evidence journals one content-addressed operatio
   const operations = (await store.replayableOperations()).filter(({ path }) => path.startsWith("evidence/"));
   assert.deepEqual(operations, [{ path: structuralPath("evidence", first.sha256), value: { ...first } }]);
 });
+
+void test("saveEvidenceFile commits temporary files, deduplicates, and journals operation", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-file-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+
+  const payload = "Streamed evidence content";
+  const bytes = Buffer.byteLength(payload, "utf8");
+  const sha256 = createHash("sha256").update(Buffer.from(payload, "utf8")).digest("hex");
+  const tempPath = join(cwd, "stream.tmp");
+  writeFileSync(tempPath, payload);
+
+  const record = await store.saveEvidenceFile(tempPath, sha256, bytes);
+  assert.equal(record.ref, `ref:sha256:${sha256.slice(0, 16)}`);
+  assert.equal(record.sha256, sha256);
+  assert.equal(record.bytes, bytes);
+  assert.ok(existsSync(record.path));
+  assert.equal(existsSync(tempPath), false);
+
+  const tempPath2 = join(cwd, "stream2.tmp");
+  writeFileSync(tempPath2, payload);
+  const record2 = await store.saveEvidenceFile(tempPath2, sha256, bytes);
+  assert.deepEqual(record2, record);
+  assert.equal(existsSync(tempPath2), false);
+});

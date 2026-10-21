@@ -46,3 +46,12 @@ void test("project settings overrides are derived from the global settings shape
   assert.match(source, /export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget" \| "codemodeTools">>;/);
   assert.doesNotMatch(source, /export interface WorkflowSettingsOverrides/);
 });
+
+void test("ShellOptions and ShellResult declare optional artifact offloading fields", () => {
+  const source = readFileSync(typesPath, "utf8");
+  assert.match(source, /\bartifact\?: boolean \| number;/);
+  assert.match(source, /\bartifactThresholdBytes\?: number;/);
+  assert.match(source, /\bstdoutEvidence\?: EvidenceRecord;/);
+  assert.match(source, /\bstderrEvidence\?: EvidenceRecord;/);
+  assert.match(source, /\bevidence\?: EvidenceRecord;/);
+});

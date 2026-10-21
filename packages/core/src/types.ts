@@ -62,8 +62,22 @@ export type PipelineItems = Record<string, JsonValue>;
 export type PipelineStage<Input extends JsonValue, Output extends JsonValue> = (value: Input) => Output | Promise<Output>;
 export type PipelineStages<Input extends JsonValue, Output extends JsonValue> = Record<string, PipelineStage<Input, Output>>;
 export type PipelineResult<Items extends PipelineItems, Output extends JsonValue> = { [Key in keyof Items]: Output };
-export interface ShellOptions { timeoutMs?: number; env?: Record<string, string> }
-export interface ShellResult { exitCode: number | null; stdout: string; stderr: string }
+export interface ShellOptions {
+  timeoutMs?: number;
+  env?: Record<string, string>;
+  artifact?: boolean | number;
+  artifactThresholdBytes?: number;
+}
+export interface ShellResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  stdoutBytes?: number;
+  stderrBytes?: number;
+  stdoutEvidence?: EvidenceRecord;
+  stderrEvidence?: EvidenceRecord;
+  evidence?: EvidenceRecord;
+}
 export const BUDGET_DIMENSIONS = ["tokens", "costUsd", "durationMs", "agentLaunches"] as const;
 export type BudgetDimension = (typeof BUDGET_DIMENSIONS)[number];
 export interface BudgetLimits { soft?: number; hard?: number }
