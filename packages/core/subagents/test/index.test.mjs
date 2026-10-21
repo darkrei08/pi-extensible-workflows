@@ -3466,3 +3466,53 @@ function deferred() {
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
 }
+
+test("registerSubagentsExtension respects enabled: false option and disables tools and navigator", async () => {
+  const registeredTools = [];
+  const registeredCommands = [];
+  let registeredWidget = false;
+  const fakePi = {
+    registerTool(tool) { registeredTools.push(tool.name); },
+    registerCommand(name) { registeredCommands.push(name); },
+    appendEntry() { registeredWidget = true; },
+  };
+  const ext = registerSubagentsExtension(fakePi, { enabled: false });
+  assert.equal(ext.tools.length, 0);
+  assert.equal(registeredTools.length, 0);
+  assert.equal(registeredCommands.length, 0);
+  assert.equal(registeredWidget, false);
+});
+
+test("registerSubagentsExtension respects PI_DISABLE_STANDALONE_SUBAGENTS env var", async () => {
+  const registeredTools = [];
+  const fakePi = {
+    registerTool(tool) { registeredTools.push(tool.name); },
+  };
+  process.env.PI_DISABLE_STANDALONE_SUBAGENTS = "1";
+  try {
+    const ext = registerSubagentsExtension(fakePi);
+    assert.equal(ext.tools.length, 0);
+    assert.equal(registeredTools.length, 0);
+  } finally {
+    delete process.env.PI_DISABLE_STANDALONE_SUBAGENTS;
+  }
+});
+
+test("registerSubagentsExtension respects extensionSettings.subagents.enabled false", async () => {
+  const root = await mkdtemp(join(tmpdir(), "subagents-settings-disable-"));
+  const agentDir = join(root, "agent");
+  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  await writeFile(settingsPath, JSON.stringify({ extensionSettings: { subagents: { enabled: false } } }));
+  const registeredTools = [];
+  const fakePi = {
+    registerTool(tool) { registeredTools.push(tool.name); },
+  };
+  try {
+    const ext = registerSubagentsExtension(fakePi, { managerDependencies: { agentDir } });
+    assert.equal(ext.tools.length, 0);
+    assert.equal(registeredTools.length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

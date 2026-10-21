@@ -1,10 +1,10 @@
 import { join } from "node:path";
 import { defineTool, getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { WorkflowError, loadCodemodeToolsSetting, loadingRegistry, reachableTools, workflowToolExposure, type JsonValue } from "../../src/index.js";
+import { WorkflowError, loadCodemodeToolsSetting, loadSubagentsEnabledSetting, loadingRegistry, reachableTools, workflowToolExposure, type JsonValue } from "../../src/index.js";
 import { clearSubagentManager, setSubagentManager } from "../../src/subagent-manager-handle.js";
 import type { SubagentIdRequest, SubagentInspectRequest, SubagentManager, SubagentManagerContext, SubagentNotification, SubagentsExtension, SubagentsExtensionOptions, SubagentRunRequest, SubagentStatus, SubagentSteerRequest } from "./contracts.js";
-import { createSubagentManager } from "./manager.js";
+import { createSubagentManager, createUnavailableSubagentManager } from "./manager.js";
 import { registerSubagentNavigator } from "./navigator.js";
 import { createSubagentBackgroundWidget, renderSubagentCall, renderSubagentControlCall, renderSubagentControlResult, renderSubagentInspectCall, renderSubagentInspectResult, renderSubagentResult } from "./view.js";
 import {
@@ -168,6 +168,12 @@ export function createSubagentsExtension(options: SubagentsExtensionOptions = {}
 }
 
 export function registerSubagentsExtension(pi: SubagentsExtensionAPI, options: SubagentsExtensionOptions = {}): SubagentsExtension {
+  const subagentsSetting = loadSubagentsEnabledSetting(options.managerDependencies?.agentDir);
+  const enabled = options.enabled ?? (process.env.PI_DISABLE_STANDALONE_SUBAGENTS === "1" || process.env.PI_SUBAGENTS === "0" ? false : subagentsSetting ?? true);
+  if (!enabled) {
+    const manager = createUnavailableSubagentManager();
+    return { manager, tools: [] };
+  }
   const getActiveTools = pi.getActiveTools;
   const getAllTools = pi.getAllTools;
   const activeTools = getActiveTools === undefined ? undefined : () => reachableTools({ getActiveTools: () => getActiveTools.call(pi), ...(getAllTools === undefined ? {} : { getAllTools: () => getAllTools.call(pi) }) });

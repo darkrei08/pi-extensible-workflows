@@ -9,7 +9,7 @@ import { WORKFLOW_CALL_KINDS } from "./types.js";
 export { validateSchema } from "./utils.js";
 
 import { validateContextFileScopes, validateSelectorList } from "./settings.js";
-export { DEFAULT_SETTINGS, loadCodemodeToolsSetting, loadSettings, loadSettingsOverrides, resolveAgentResourcePolicy, resolveWorkflowSettings, saveModelAliases, validateContextFileScopes, validateModelAliasAvailability, validateSelectorList, validateWorkflowExtensionSettings, workflowProjectSettingsPath, workflowSettingsPath, workflowToolExposure } from "./settings.js";
+export { DEFAULT_SETTINGS, loadCodemodeToolsSetting, loadSubagentsEnabledSetting, loadSettings, loadSettingsOverrides, resolveAgentResourcePolicy, resolveWorkflowSettings, saveModelAliases, validateContextFileScopes, validateModelAliasAvailability, validateSelectorList, validateWorkflowExtensionSettings, workflowProjectSettingsPath, workflowSettingsPath, workflowToolExposure } from "./settings.js";
 
 export function validateCheckpoint(value: unknown): CheckpointInput {
   if (!object(value) || Object.keys(value).some((key) => !["name", "prompt", "context"].includes(key)) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.prompt !== "string" || !jsonValue(value.context)) fail("INVALID_METADATA", "checkpoint requires only name, prompt, and JSON context");

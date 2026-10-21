@@ -182,6 +182,7 @@ export interface SubagentsExtensionOptions {
   readonly manager?: SubagentManager;
   readonly clipboard?: (value: string) => Promise<void>;
   readonly managerDependencies?: SubagentManagerDependencies;
+  readonly enabled?: boolean;
 }
 
 export interface SubagentsExtension {

@@ -85,6 +85,13 @@ export function validateWorkflowExtensionSettings(value: unknown, settingsPath: 
       normalized.trajectory = Object.freeze({ ...(raw.port === undefined ? {} : { port: raw.port }) });
       continue;
     }
+    if (namespace === "subagents") {
+      if (!object(raw)) fail(errorCode, `${base}.subagents must be an object`);
+      if (Object.keys(raw).some((key) => key !== "enabled")) fail(errorCode, `${base}.subagents contains an unsupported setting`);
+      if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") fail(errorCode, `${base}.subagents.enabled must be a boolean`);
+      normalized.subagents = Object.freeze({ ...(raw.enabled === undefined ? {} : { enabled: raw.enabled }) });
+      continue;
+    }
     normalized[namespace] = structuredClone(raw);
   }
   return deepFreeze(normalized as WorkflowExtensionSettings);
@@ -147,6 +154,14 @@ export function workflowToolExposure(name: string, codemodeTools: WorkflowSettin
 /** The `codemodeTools` setting at load time. Invalid settings keep the default; launches report them. */
 export function loadCodemodeToolsSetting(agentDir?: string): WorkflowSettings["codemodeTools"] {
   try { return loadSettings(workflowSettingsPath(agentDir)).codemodeTools; } catch { return undefined; }
+}
+export function loadSubagentsEnabledSetting(agentDir?: string): boolean | undefined {
+  try {
+    const s = loadSettings(workflowSettingsPath(agentDir)).extensionSettings?.subagents as { enabled?: boolean } | undefined;
+    return typeof s?.enabled === "boolean" ? s.enabled : undefined;
+  } catch {
+    return undefined;
+  }
 }
 export function loadSettingsOverrides(path: string): Readonly<WorkflowSettingsOverrides> { return parseSettings(path, true); }
 export function resolveWorkflowSettings(cwd: string, projectTrusted: boolean, globalSettingsPath = workflowSettingsPath()): WorkflowSettingsResolution & { selectorSources: AgentResourceSelectorSources } {
