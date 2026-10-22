@@ -18,10 +18,10 @@ S6. Verification must include focused red/green regressions, build, lint, full r
 
 ## Tasks
 
-- T1 [S1-S2] Isolate the core test runner's HOME and related user resource roots per test process so ambient skills cannot enter fixture discovery. Route: `packages/core/package.json` and test runner environment. Commit: pending.
-- T2 [S1-S3] Replace the fixed issue #105 polling budget with a bounded scheduler-tolerant wait that remains deterministic and reports the same failure. Route: `packages/core/test/support.ts`. Commit: pending.
-- T3 [S1-S4] Make Chromium trajectory fixtures navigate away from `about:blank` before page-state assertions while retaining bounded CDP startup and cleanup. Route: `packages/core/trajectory/test/trajectory-browser.test.ts`. Commit: pending.
-- T4 [S1-S6] Run focused red/green checks, lint/build, the full repository check, native review, and reconcile temporary sessions/processes. Route: verification and delivery. Commit: pending.
+- T1 [S1-S2] Isolate the core test runner's HOME and related user resource roots per test process so ambient skills cannot enter fixture discovery. Route: `packages/core/package.json` and test runner environment. Commit: `18f11b9`.
+- T2 [S1-S3] Replace the fixed issue #105 polling budget with a bounded scheduler-tolerant wait that remains deterministic and reports the same failure. Route: `packages/core/test/support.ts`. Commit: `18f11b9`.
+- T3 [S1-S4] Make Chromium trajectory fixtures navigate away from `about:blank` before page-state assertions while retaining bounded CDP startup and cleanup. Route: `packages/core/trajectory/test/trajectory-browser.test.ts`. Commit: `18f11b9`.
+- T4 [S1-S6] Run focused red/green checks, lint/build, the full repository check, native review, and reconcile temporary sessions/processes. Route: verification and delivery. Commit: `18f11b9`.
 
 ## Log
 
@@ -31,3 +31,4 @@ L3. Parent spot-check confirmed the relevant runner, helper, and browser fixture
 L4. Focused red/green evidence: the four resource-selector files failed before the runner HOME isolation and passed after it; `trajectory-load.test.js` passed after the scheduler-tolerant polling change. A read-only Chromium workflow reproduction confirmed Chromium reported the expected target URL while the connected document was still `about:blank` and the fixture server had received no request; the fix must explicitly navigate after CDP connection.
 L5. A second read-only workflow reproduction confirmed the browser-file timeout was the root test's cumulative 120-second budget under serial Chromium subtests: the first four tests consumed about 104 seconds and the fifth was cancelled, while the fifth passed alone. The runner timeout is therefore 300000 ms; the bounded process parallelism remains `-P4` and browser process groups are explicitly signaled during normal cleanup.
 L6. Herdr verification passed the focused resource/polling set, trajectory browser file (`7/7`), and Herdr trajectory integration (`4/4`) after preserving the authenticated operator HOME for `test:herdr`; the non-auth core runners retain isolated HOME and agent roots. Build and lint passed. The root `npm run check` reached the CLI suite and reproducibly failed only in pre-existing `doctor-cleanup` evidence tests: tampered bytes report byte-count corruption instead of checksum mismatch, and the read-count assertion reports `0` instead of `4`. A concurrent build/test attempt also produced a transient missing `dist/trajectory/src/assets/index.html`; no concurrent build was used for the successful browser run.
+L7. Work unit `18f11b9` received native review lineage `review-179f3bd10eda2fdf` across risk, resilience, and reliability; all three reviewers were submitted and the exact acknowledgement completed with native authority burned. No push or pull request was performed.
