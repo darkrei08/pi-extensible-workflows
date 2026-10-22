@@ -1,0 +1,13 @@
+# Deterministic full checks tasks
+
+- T1: Isolate the core test runner's HOME and related user resource roots per test process so ambient skills cannot enter fixture discovery. Route: packages/core/package.json. Commit: pending.
+- T2: Replace the fixed issue #105 polling budget with a bounded scheduler-tolerant wait. Route: packages/core/test/support.ts. Commit: pending.
+- T3: Navigate Chromium trajectory fixtures to the requested application page before state assertions while retaining bounded startup and cleanup. Route: packages/core/trajectory/test/trajectory-browser.test.ts. Commit: pending.
+- T4: Run focused red/green checks, build, lint, full repository check, native review, and process/session cleanup. Commit: pending.
+
+## Evidence
+
+- Focused resource/polling regression set passed under the isolated runner.
+- `TEST_FILES='dist/trajectory/test/trajectory-browser.test.js' npm run test:run --workspace=packages/core` passed `7/7`.
+- `env -u PI_CODING_AGENT_DIR npm run test:herdr --workspace=packages/core` passed `4/4`; authenticated Herdr Navigator requires the operator HOME.
+- Root build and lint passed; root `npm run check` reached CLI tests and failed in two existing `doctor-cleanup` assertions unrelated to the core test-infrastructure diff.
