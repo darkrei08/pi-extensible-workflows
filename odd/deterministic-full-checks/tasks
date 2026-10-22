@@ -17,5 +17,5 @@
 - Focused CLI verification passed: CLI build, lint, and `doctor-cleanup` tests exited 0.
 - Full `npm run check` exited 0: build, lint, core/CLI/Herdr/template tests, and docs check passed; reported 3 layout, 50 widget, 71 subagent, 34 Herdr, and 1 template test, all passing; docs check reported 7 HTML pages and 8 required files.
 - Native review was attempted with readability and reliability lenses, but exact reviewer capture bindings were rejected after abandon/restart without mutation; the user explicitly chose to proceed without native review proof.
-- Work unit `9358cd1` was committed locally; branch and origin verification remain pending before push.
+- Work unit `9358cd1` and delivery evidence `d3115ff` were committed locally; branch `feat/shell-evidence-offloading` was verified clean and pushed to `origin` at `d3115ff9725df93eb48c26411aa98c3d0461d0d4`. No pull request was opened.
 - User scope change, verbatim: "procedi con la revisione finale e risolvere i blocchi con skil piherder orchestratrtion e con pi wojrflow con tuoli ed alias ed effort e con exellence engienring e procedi a commit locali e dopo push sul repo". This authorizes resolving the CLI blocker, local commits, and push to origin without requesting a pull request.
