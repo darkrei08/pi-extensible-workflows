@@ -280,18 +280,18 @@ void test("doctor cleanup hashes exact evidence bytes", async () => {
   writeFileSync(replacement.path, Buffer.from([0xff]));
   const report = await doctorCleanup({ ...invalidPaths, olderThanDays: 90, yes: true, now });
   assert.equal(report.failures.length, 1);
-  assert.match(report.failures[0]?.message ?? "", /Evidence artifact content does not match checksum/);
+  assert.match(report.failures[0]?.message ?? "", /Evidence artifact content or byte count is invalid/);
   assert.deepEqual(report.deleted, []);
   assert.equal(existsSync(invalid.directory), true);
   assert.equal(existsSync(sibling.directory), true);
 });
 // Counts evidence payload reads through the real fs binding that RunStore imports; `onRead` runs before each read.
 async function withEvidenceReads<T>(onRead: () => void, action: () => Promise<T>): Promise<{ value: T; reads: number }> {
-  const original = fs.promises.readFile;
+  const original = fs.createReadStream;
   let reads = 0;
-  fs.promises.readFile = ((...args: Parameters<typeof original>) => { onRead(); if (typeof args[0] === "string" && args[0].includes(`${sep}evidence${sep}`)) reads += 1; return original(...args); }) as typeof original;
+  fs.createReadStream = (...args: Parameters<typeof original>) => { onRead(); if (typeof args[0] === "string" && args[0].includes(`${sep}evidence${sep}`)) reads += 1; return original(...args); };
   syncBuiltinESMExports();
-  try { return { value: await action(), reads }; } finally { fs.promises.readFile = original; syncBuiltinESMExports(); }
+  try { return { value: await action(), reads }; } finally { fs.createReadStream = original; syncBuiltinESMExports(); }
 }
 void test("doctor cleanup hashes each unchanged evidence artifact once and rehashes changed ones", async () => {
   const now = 1_000_000_000_000;
@@ -305,18 +305,23 @@ void test("doctor cleanup hashes each unchanged evidence artifact once and rehas
   const tamperedPaths = fixture();
   const tampered = await Promise.all(["run-a", "run-b", "run-c", "run-d"].map(async (runId) => { const store = await makeRun(tamperedPaths, runId, "failed", now); return { store, record: await saveEvidence(store, `${runId} log`) }; }));
   let changed = false;
-  // After the first deletion, rewrite a surviving artifact with same-size bytes before the next rescan.
-  const report = await withEvidenceReads(() => {
-    if (changed || tampered.every(({ store }) => existsSync(store.directory))) return;
+  // Rewrite a surviving artifact after the first deletion so the next rescan observes a changed file identity.
+  const originalDelete = Reflect.get(RunStore.prototype, "delete");
+  RunStore.prototype.delete = async function (confirmed: boolean): Promise<void> {
+    await originalDelete.call(this, confirmed);
+    if (changed) return;
     const survivor = tampered.find(({ store }) => existsSync(store.directory));
     assert.ok(survivor);
     writeFileSync(survivor.record.path, "x".repeat(survivor.record.bytes));
     changed = true;
-  }, () => doctorCleanup({ ...tamperedPaths, olderThanDays: 90, yes: true, now }));
+  };
+  let report: { value: Awaited<ReturnType<typeof doctorCleanup>>; reads: number };
+  try { report = await withEvidenceReads(() => {}, () => doctorCleanup({ ...tamperedPaths, olderThanDays: 90, yes: true, now })); }
+  finally { RunStore.prototype.delete = originalDelete; }
   assert.equal(changed, true);
   assert.equal(report.value.deleted.length, 1);
   assert.equal(report.value.failures.length, 1);
-  assert.match(report.value.failures[0]?.message ?? "", /Evidence artifact content does not match checksum/);
+  assert.match(report.value.failures[0]?.message ?? "", /Evidence artifact content or byte count is invalid/);
   assert.equal(tampered.filter(({ store }) => existsSync(store.directory)).length, 3);
   assert.equal(runs.some(({ store }) => existsSync(store.directory)), false);
 });

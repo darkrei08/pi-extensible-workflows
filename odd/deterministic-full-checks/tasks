@@ -4,6 +4,8 @@
 - T2: Replace the fixed issue #105 polling budget with a bounded scheduler-tolerant wait. Route: packages/core/test/support.ts. Commit: 18f11b9.
 - T3: Navigate Chromium trajectory fixtures to the requested application page before state assertions while retaining bounded startup and cleanup. Route: packages/core/trajectory/test/trajectory-browser.test.ts. Commit: 18f11b9.
 - T4: Run focused red/green checks, build, lint, full repository check, native review, and process/session cleanup. Commit: 18f11b9.
+- T5: Resolve the CLI doctor-cleanup evidence-test blockers, rerun the full repository check, and record the exact result. Route: packages/cli/test/doctor-cleanup.test.ts and verification. Commit: pending.
+- T6: Perform final native review, local commit, branch/remote verification, and user-authorized push without opening a pull request. Route: delivery. Commit: pending.
 
 ## Evidence
 
@@ -12,3 +14,6 @@
 - `env -u PI_CODING_AGENT_DIR npm run test:herdr --workspace=packages/core` passed `4/4`; authenticated Herdr Navigator requires the operator HOME.
 - Root build and lint passed; root `npm run check` reached CLI tests and failed in two existing `doctor-cleanup` assertions unrelated to the core test-infrastructure diff.
 - Native review lineage `review-179f3bd10eda2fdf` submitted risk, resilience, and reliability lenses and completed exact acknowledgement; authority was burned.
+- Focused CLI verification passed: CLI build, lint, and `doctor-cleanup` tests exited 0.
+- Full `npm run check` exited 0: build, lint, core/CLI/Herdr/template tests, and docs check passed; reported 3 layout, 50 widget, 71 subagent, 34 Herdr, and 1 template test, all passing; docs check reported 7 HTML pages and 8 required files.
+- User scope change, verbatim: "procedi con la revisione finale e risolvere i blocchi con skil piherder orchestratrtion e con pi wojrflow con tuoli ed alias ed effort e con exellence engienring e procedi a commit locali e dopo push sul repo". This authorizes resolving the CLI blocker, local commits, and push to origin without requesting a pull request.
