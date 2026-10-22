@@ -1,6 +1,6 @@
 # Shell evidence retrieval tasks
 
-- T1: Automatic spill, bounded tails, truncation metadata, and hard caps. Focused verification passed; commit pending.
-- T2: Compact journal representation and replay reconstruction. Focused verification passed; commit pending.
-- T3: Regression coverage and synchronized documentation. Focused verification passed; commit pending.
-- T4: Full verification and issue-linked PR preparation. Focused checks passed; full repository verification remains pending.
+- T1: Automatic spill, bounded tails, truncation metadata, and hard caps. Focused verification passed; commit 1c45e0a.
+- T2: Compact journal representation and replay reconstruction. Focused verification passed; commit 1c45e0a.
+- T3: Regression coverage and synchronized documentation. Focused verification passed; commit 1c45e0a.
+- T4: Full verification and issue-linked PR preparation. Focused checks passed; full repository verification remains pending; commit 1c45e0a.
