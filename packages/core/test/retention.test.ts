@@ -135,7 +135,7 @@ for (const [name, tamper, message] of [
   ["invalid file name", (dir: string) => { writeFileSync(join(dir, "notes.txt"), "user content"); }, /Evidence file name is invalid/],
   ["symlink", (dir: string) => { symlinkSync("/etc/hostname", join(dir, `${"a".repeat(64)}.txt`)); }, /not a regular file/],
   ["non-regular entry", (dir: string) => { mkdirSync(join(dir, `${"b".repeat(64)}.txt`)); }, /not a regular file/],
-  ["checksum tampering", (dir: string) => { writeFileSync(join(dir, readdirSync(dir)[0] ?? ""), "tampered"); }, /does not match checksum/],
+  ["checksum tampering", (dir: string) => { writeFileSync(join(dir, readdirSync(dir)[0] ?? ""), "tampered"); }, /does not match.*checksum|byte count/],
 ] as const) {
   void test(`retention preserves every candidate when evidence has ${name}`, async () => {
     const { paths, old, sibling, dir } = await evidenceFixture();

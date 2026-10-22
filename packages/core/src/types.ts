@@ -72,6 +72,7 @@ export interface ShellResult {
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  truncated?: boolean;
   stdoutBytes?: number;
   stderrBytes?: number;
   stdoutEvidence?: EvidenceRecord;

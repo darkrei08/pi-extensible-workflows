@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- Shell output now spills automatically to run-scoped evidence before the RPC boundary, returns bounded UTF-8-safe tails with truncation metadata, preserves stdout/stderr byte counts and exit codes, and replays evidence-backed results without rerunning commands.
+
 ## [6.2.2] - 2026-10-18
 
 ### Fixes

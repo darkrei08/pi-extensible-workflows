@@ -33,11 +33,11 @@ return agent(prompt("Summarize these reports:\n\n{reports}", { reports }));
 
 Launch with a non-empty `name` and exactly one of `script` or `scriptPath`. Registered functions are available as globals, and JSON-compatible launch values are available through `args`. Runs are backgrounded by default; set `foreground: true` to wait for the final value.
 
-For shell tasks with output exceeding the 10 MB JSON RPC limit, `shell(command, { artifact: true })` streams stdout/stderr to content-addressed evidence storage and returns a compact reference (`res.stdoutEvidence`) readable in bounded pages via `tools.read({ path, offset, limit })`.
+Shell output is buffered inline only up to the journal threshold, then automatically streams stdout/stderr to run-scoped content-addressed evidence storage. Small results keep the `{ exitCode, stdout, stderr }` shape; spilled results add byte counts and compact evidence references (`res.stdoutEvidence`/`res.stderrEvidence`/`res.evidence`) readable in bounded pages via `tools.read({ path, offset, limit })`. Results that would exceed the 10 MB JSON RPC boundary return a bounded UTF-8-safe tail with `truncated: true`, while the complete output remains replayable from evidence. `artifact` and `artifactThresholdBytes` remain compatibility controls for forcing a lower spill threshold. Each stream and run has a hard byte cap; exceeding a cap fails and cleans up temporary or already-committed evidence.
 
 ## Programmatic integration
 
-The package exports the workflow registry, runtime, persistence, validation, settings, generic agent preparation, lifecycle, and local Pi session APIs used by trusted hosts and extensions.
+The package exports the workflow registry, runtime, persistence, validation, settings, generic agent preparation, lifecycle, and local Pi session APIs used by trusted hosts and extensions. The exported `executeShellCommand` keeps its fifth `RunStore | string` argument compatibility: string evidence-directory callers remain supported, while RunStore-backed evidence calls validate the trusted run and evidence directories before writing.
 
 Direct consumers of `createLocalPiSession()` receive a session with extensions already bound. Always `await session.dispose()` so `session_shutdown` runs before the native session is released; disposal is idempotent.
 

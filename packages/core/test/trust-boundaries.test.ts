@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { ChildProcess, execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
-import workflowExtension, { RPC_LIMIT_BYTES, RunStore, createLaunchSnapshot, runWorkflow, WorkflowError } from "../src/index.js";
+import workflowExtension, { RPC_LIMIT_BYTES, RunStore, SHELL_ARTIFACT_STREAM_LIMIT_BYTES, SHELL_ARTIFACT_TOTAL_LIMIT_BYTES, createLaunchSnapshot, runWorkflow, WorkflowError } from "../src/index.js";
 import { listRunIds } from "../src/persistence.js";
 
 
 import { executeShellCommand } from "../src/execution.js";
 
-
+async function shellEvidenceStore(cwd: string): Promise<RunStore> {
+  const store = new RunStore(cwd, "session", "run", cwd);
+  await store.create({ id: "run", workflowName: "shell", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return 1", args: null, metadata: { name: "shell" }, settings: { concurrency: 1 }, models: [], tools: [], agentConfigurations: {}, schemas: [] }));
+  return store;
+}
 
 
 void test("workflow JavaScript cannot cross filesystem, network, or process boundaries", async () => {
@@ -42,7 +46,7 @@ void test("forged worktree metadata cannot redirect cleanup", async () => {
   assert.doesNotThrow(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", "keep-me"], { stdio: "ignore" }));
 });
 
-void test("accepted shell stays host-trusted while oversized RPC results are never journaled", async () => {
+void test("accepted shell stays host-trusted while oversized results spill before the RPC boundary", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-shell-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-shell-cwd-"));
   const marker = join(cwd, "shell-marker");
@@ -66,18 +70,27 @@ void test("accepted shell stays host-trusted while oversized RPC results are nev
   assert.ok(oversizedWorkflow);
   const oversizedScript = `require("node:fs").writeFileSync(${JSON.stringify(oversizedMarker)}, "ran");process.stdout.write("x".repeat(${String(RPC_LIMIT_BYTES - 32)}))`;
   const oversizedCommand = `${process.execPath} -e ${JSON.stringify(oversizedScript)}`;
-  await assert.rejects(oversizedWorkflow.execute("id", { name: "oversized-shell", script: `return await shell(${JSON.stringify(oversizedCommand)});`, foreground: true }, new AbortController().signal, undefined, { cwd: oversizedCwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  const oversizedExecution = await oversizedWorkflow.execute("id", { name: "oversized-shell", script: `return await shell(${JSON.stringify(oversizedCommand)});`, foreground: true }, new AbortController().signal, undefined, { cwd: oversizedCwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const oversizedPayload = oversizedExecution as { content: Array<{ text: string }>; details?: { value?: unknown } };
+  const oversizedResult = (oversizedPayload.details?.value ?? JSON.parse(oversizedPayload.content[0]?.text ?? "null")) as { exitCode: number; stdout: string; truncated?: boolean; stdoutEvidence?: { path: string; bytes: number } };
+  assert.equal(oversizedResult.exitCode, 0);
+  assert.equal(oversizedResult.truncated, true);
+  assert.ok(oversizedResult.stdoutEvidence);
+  assert.ok(oversizedResult.stdout.length > 0);
   assert.equal(readFileSync(oversizedMarker, "utf8"), "ran");
   const [runId] = await listRunIds(oversizedCwd, "session", oversizedHome);
   assert.ok(runId);
-  const journal = JSON.parse(readFileSync(join(new RunStore(oversizedCwd, "session", runId, oversizedHome).directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
-  assert.deepEqual(journal.completed, {});
+  const store = new RunStore(oversizedCwd, "session", runId, oversizedHome);
+  const journal = JSON.parse(readFileSync(join(store.directory, "journal.json"), "utf8")) as { completed: Record<string, { value: unknown }> };
+  const shellEntry = Object.values(journal.completed).find(({ value }) => typeof value === "object" && value !== null && "stdoutEvidence" in value);
+  assert.ok(shellEntry);
+  assert.ok(JSON.stringify(shellEntry.value).length < 2_000_000);
 });
-void test("rejects oversized raw shell output and terminates its process group", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
+void test("rejects shell output above the hard cap and terminates its process group", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-raw-shell-limit-"));
   const survivor = join(cwd, "survivor");
   const survivorScript = `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(survivor)}, "survived"), 500);`;
-  const script = `const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(survivorScript)}], { stdio: "ignore" }); process.stdout.write("x".repeat(${String(RPC_LIMIT_BYTES + 1)})); setTimeout(() => {}, 10_000);`;
+  const script = `const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", ${JSON.stringify(survivorScript)}], { stdio: "ignore" }); process.stdout.write("x".repeat(${String(SHELL_ARTIFACT_STREAM_LIMIT_BYTES + 1)})); setTimeout(() => {}, 10_000);`;
   const command = `${process.execPath} -e ${JSON.stringify(script)}`;
   await assert.rejects(executeShellCommand(command, {}, new AbortController().signal, cwd), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
   await new Promise((resolve) => setTimeout(resolve, 750));
@@ -106,7 +119,7 @@ void test("pre-aborted shell launch cancels without leaving a child process grou
 void test("shell with artifact mode preserves small results below threshold unchanged", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-small-"));
   const command = `${process.execPath} -e "process.stdout.write('hello stdout'); process.stderr.write('hello stderr')"`;
-  const result = await executeShellCommand(command, { artifact: true }, new AbortController().signal, cwd);
+  const result = await executeShellCommand(command, { artifact: true }, new AbortController().signal, cwd, await shellEvidenceStore(cwd));
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "hello stdout");
   assert.equal(result.stderr, "hello stderr");
@@ -115,16 +128,47 @@ void test("shell with artifact mode preserves small results below threshold unch
   assert.equal(result.evidence, undefined);
 });
 
+void test("executeShellCommand keeps string evidence-directory compatibility", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-string-evidence-"));
+  const evidenceDir = join(cwd, "legacy-evidence");
+  const command = `${process.execPath} -e ${JSON.stringify("process.stdout.write('legacy output')")}`;
+  const plain = await executeShellCommand(command, {}, new AbortController().signal, cwd, evidenceDir);
+  assert.equal(plain.stdout, "legacy output");
+  assert.equal(existsSync(evidenceDir), false);
+  const artifact = await executeShellCommand(command, { artifactThresholdBytes: 1 }, new AbortController().signal, cwd, evidenceDir);
+  assert.equal(artifact.stdout, "legacy output");
+  assert.ok(artifact.stdoutEvidence);
+  assert.equal(readFileSync(artifact.stdoutEvidence.path, "utf8"), "legacy output");
+});
+
+void test("shell artifact mode rejects symlinked run and evidence directories before creating output", { skip: process.platform === "win32" }, async () => {
+  const runCwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-symlink-run-"));
+  const runStore = await shellEvidenceStore(runCwd);
+  const realRunDirectory = join(dirname(runStore.directory), "real-run");
+  renameSync(runStore.directory, realRunDirectory);
+  symlinkSync(realRunDirectory, runStore.directory, "dir");
+  const command = `${process.execPath} -e ${JSON.stringify("process.stdout.write('X'.repeat(1000))")}`;
+  await assert.rejects(executeShellCommand(command, { artifactThresholdBytes: 1 }, new AbortController().signal, runCwd, runStore), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  assert.equal(existsSync(join(realRunDirectory, "evidence")), false);
+
+  const evidenceCwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-symlink-evidence-"));
+  const evidenceStore = await shellEvidenceStore(evidenceCwd);
+  const outside = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-symlink-target-"));
+  symlinkSync(outside, evidenceStore.evidenceDirectory(), "dir");
+  await assert.rejects(executeShellCommand(command, { artifactThresholdBytes: 1 }, new AbortController().signal, evidenceCwd, evidenceStore), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  assert.deepEqual(readdirSync(outside), []);
+});
+
 void test("shell with artifact mode offloads above-threshold stdout to evidence store", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-large-"));
   const store = new RunStore(cwd, "session", "run", cwd);
   await store.create({ id: "run", workflowName: "test", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return 1", args: null, metadata: { name: "test" }, settings: { concurrency: 1 }, models: [], tools: [], agentConfigurations: {}, schemas: [] }));
-  const outputLength = RPC_LIMIT_BYTES + 1024;
+  const outputLength = 256 * 1024;
   const script = `process.stdout.write("A".repeat(${String(outputLength)}))`;
   const command = `${process.execPath} -e ${JSON.stringify(script)}`;
-  const result = await executeShellCommand(command, { artifact: true }, new AbortController().signal, cwd, store);
+  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store);
   assert.equal(result.exitCode, 0);
-  assert.equal(result.stdout, "");
+  assert.equal(result.stdout, "A".repeat(outputLength));
   assert.equal(result.stderr, "");
   assert.equal(result.stdoutBytes, outputLength);
   assert.ok(result.stdoutEvidence);
@@ -141,11 +185,12 @@ void test("shell with artifact mode offloads above-threshold stdout to evidence 
 
 void test("shell with artifact mode preserves non-zero exit code with evidence", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-nonzero-"));
+  const store = await shellEvidenceStore(cwd);
   const script = `process.stdout.write("FAIL".repeat(500)); process.exit(42)`;
   const command = `${process.execPath} -e ${JSON.stringify(script)}`;
-  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd);
+  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store);
   assert.equal(result.exitCode, 42);
-  assert.equal(result.stdout, "");
+  assert.equal(result.stdout, "FAIL".repeat(500));
   assert.ok(result.stdoutEvidence);
   assert.equal(result.stdoutBytes, 2000);
   assert.equal(readFileSync(result.stdoutEvidence.path, "utf8"), "FAIL".repeat(500));
@@ -153,12 +198,13 @@ void test("shell with artifact mode preserves non-zero exit code with evidence",
 
 void test("shell with artifact mode offloads above-threshold stderr to evidence store", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-stderr-"));
+  const store = await shellEvidenceStore(cwd);
   const script = `process.stderr.write("ERR".repeat(500)); process.stdout.write("ok")`;
   const command = `${process.execPath} -e ${JSON.stringify(script)}`;
-  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd);
+  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store);
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout, "ok");
-  assert.equal(result.stderr, "");
+  assert.equal(result.stderr, "ERR".repeat(500));
   assert.ok(result.stderrEvidence);
   assert.equal(result.evidence, result.stderrEvidence);
   assert.equal(result.stderrBytes, 1500);
@@ -167,11 +213,12 @@ void test("shell with artifact mode offloads above-threshold stderr to evidence 
 
 void test("shell with artifact mode preserves Unicode integrity and hash", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-unicode-"));
+  const store = await shellEvidenceStore(cwd);
   const unicodePayload = "🚀 Unicode \u2603 \u{1F389} \u{1F984} 測試 ";
   const repeatCount = 200;
   const script = `process.stdout.write(${JSON.stringify(unicodePayload)}.repeat(${String(repeatCount)}))`;
   const command = `${process.execPath} -e ${JSON.stringify(script)}`;
-  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd);
+  const result = await executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store);
   assert.equal(result.exitCode, 0);
   assert.ok(result.stdoutEvidence);
   const expectedContent = unicodePayload.repeat(repeatCount);
@@ -184,15 +231,84 @@ void test("shell with artifact mode preserves Unicode integrity and hash", async
 
 void test("shell with artifact mode cleans up temporary files on cancellation", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-cancel-"));
-  const evidenceDir = join(cwd, "evidence");
+  const store = await shellEvidenceStore(cwd);
+  const evidenceDir = store.evidenceDirectory();
   const script = `setInterval(() => process.stdout.write("X".repeat(1000)), 50);`;
   const command = `${process.execPath} -e ${JSON.stringify(script)}`;
   const controller = new AbortController();
-  const promise = executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, controller.signal, cwd, evidenceDir);
+  const promise = executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, controller.signal, cwd, store);
   await new Promise((resolve) => setTimeout(resolve, 200));
   controller.abort();
   await assert.rejects(promise, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   await new Promise((resolve) => setTimeout(resolve, 300));
   const files = existsSync(evidenceDir) ? readdirSync(evidenceDir) : [];
   assert.deepEqual(files.filter((f) => f.startsWith(".tmp")), [], "no leftover temporary files after cancellation");
+});
+
+void test("shell artifact mode reports write errors and removes temporary evidence", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-write-error-"));
+  const store = await shellEvidenceStore(cwd);
+  const failingStore = { evidenceDirectory: () => store.evidenceDirectory(), saveEvidenceFile: async () => { throw new Error("evidence write failed"); }, discardEvidence: async () => {} };
+  const script = `process.stdout.write("X".repeat(1000));`;
+  const command = `${process.execPath} -e ${JSON.stringify(script)}`;
+  await assert.rejects(executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, failingStore), (error: unknown) => error instanceof WorkflowError && error.code === "SHELL_FAILED" && error.message.includes("evidence write failed"));
+  assert.deepEqual(readdirSync(store.evidenceDirectory()), []);
+});
+
+void test("shell readable stream errors fail before artifact processing and clean up", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-readable-error-"));
+  const store = await shellEvidenceStore(cwd);
+  type SpawnableChildProcess = ChildProcess & { spawn(options: object): void };
+  const spawnablePrototype = ChildProcess.prototype as unknown as { spawn: (this: SpawnableChildProcess, options: object) => void };
+  const originalSpawn = spawnablePrototype.spawn;
+  spawnablePrototype.spawn = function (this: SpawnableChildProcess, options: object) {
+    originalSpawn.call(this, options);
+    queueMicrotask(() => this.stdout?.emit("error", new Error("readable stream failed")));
+  };
+  try {
+    const command = `${process.execPath} -e ${JSON.stringify("process.stdout.write(\\\"X\\\".repeat(1000))")}`;
+    await assert.rejects(executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store), (error: unknown) => error instanceof WorkflowError && error.code === "SHELL_FAILED" && error.message.includes("readable stream failed"));
+  } finally { spawnablePrototype.spawn = originalSpawn; }
+  const files = existsSync(store.evidenceDirectory()) ? readdirSync(store.evidenceDirectory()) : [];
+  assert.deepEqual(files, []);
+});
+
+void test("shell artifact mode rolls back stdout when the second evidence commit fails", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-second-stream-"));
+  const store = await shellEvidenceStore(cwd);
+  let commits = 0;
+  const failingStore = {
+    evidenceDirectory: () => store.evidenceDirectory(),
+    saveEvidenceFile: async (tempPath: string, sha256: string, bytes: number) => {
+      commits += 1;
+      if (commits === 2) throw new Error("stderr evidence commit failed");
+      return store.saveEvidenceFile(tempPath, sha256, bytes);
+    },
+    discardEvidence: (record: Parameters<RunStore["discardEvidence"]>[0]) => store.discardEvidence(record),
+  };
+  const childScript = `process.stdout.write("O".repeat(200000)); setImmediate(() => process.stderr.write("E".repeat(200000)))`;
+  const command = `${process.execPath} -e ${JSON.stringify(childScript)}`;
+  await assert.rejects(executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, failingStore), (error: unknown) => error instanceof WorkflowError && error.code === "SHELL_FAILED" && error.message.includes("stderr evidence commit failed"));
+  assert.equal(commits, 2);
+  assert.deepEqual(readdirSync(store.evidenceDirectory()), []);
+  assert.deepEqual((await store.replayableOperations()).filter(({ path }) => path.startsWith("evidence/")), []);
+});
+
+void test("shell artifact mode rejects per-stream cap and removes temporary evidence", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-stream-cap-"));
+  const store = await shellEvidenceStore(cwd);
+  const script = `process.stdout.write("X".repeat(${String(SHELL_ARTIFACT_STREAM_LIMIT_BYTES + 1)}));`;
+  const command = `${process.execPath} -e ${JSON.stringify(script)}`;
+  await assert.rejects(executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  assert.deepEqual(readdirSync(store.evidenceDirectory()), []);
+});
+
+void test("shell artifact mode rejects total cap even when each stream is below its cap", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-total-cap-"));
+  const store = await shellEvidenceStore(cwd);
+  const each = Math.floor(SHELL_ARTIFACT_TOTAL_LIMIT_BYTES / 2) + 1;
+  const script = `process.stdout.write("O".repeat(${String(each)})); process.stderr.write("E".repeat(${String(each)}));`;
+  const command = `${process.execPath} -e ${JSON.stringify(script)}`;
+  await assert.rejects(executeShellCommand(command, { artifact: true, artifactThresholdBytes: 100 }, new AbortController().signal, cwd, store), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  assert.deepEqual(readdirSync(store.evidenceDirectory()), []);
 });

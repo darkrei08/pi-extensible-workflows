@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, jsonValue, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
@@ -14,15 +15,65 @@ import {
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference, type EvidenceRecord,
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
-import { runsDirectory, safePart, structuralPath } from "./paths.js";
+import { piResourceContains, runsDirectory, safePart, structuralPath } from "./paths.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
 const SYSTEM_PROMPT_BODIES = "bodies";
 const SYSTEM_PROMPT_SEQUENCE = "sequence";
 const SYSTEM_PROMPT_ARTIFACT = { version: 2 as const, format: "append-only" as const, storage: SYSTEM_PROMPT_STORAGE };
-function assertEvidenceIntegrity(content: Buffer, sha256: string, path: string): void {
-  if (createHash("sha256").update(content).digest("hex") !== sha256) throw new WorkflowError("RESULT_INVALID", `Evidence artifact content does not match its checksum: ${path}`);
+export const MAX_EVIDENCE_BYTES_PER_RUN = 64 * 1024 * 1024;
+export const MAX_EVIDENCE_COUNT_PER_RUN = 256;
+async function evidenceDigest(path: string): Promise<{ sha256: string; bytes: number }> {
+  const hash = createHash("sha256");
+  let bytes = 0;
+  for await (const chunk of createReadStream(path)) {
+    const buffer = Buffer.from(chunk as Uint8Array);
+    hash.update(buffer);
+    bytes += buffer.byteLength;
+  }
+  return { sha256: hash.digest("hex"), bytes };
+}
+async function assertEvidenceDirectory(runsDirectoryPath: string, runDirectory: string, directory: string, code: "RESULT_INVALID" | "RESUME_INCOMPATIBLE"): Promise<void> {
+  const runInfo = await lstat(runDirectory).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) throw new WorkflowError(code, `Run directory is missing: ${runDirectory}`); throw error; });
+  if (!runInfo.isDirectory() || runInfo.isSymbolicLink()) throw new WorkflowError(code, `Run directory is not a trusted regular directory: ${runDirectory}`);
+  const [canonicalRunsDirectory, canonicalRunDirectory] = await Promise.all([realpath(runsDirectoryPath), realpath(runDirectory)]);
+  if (dirname(canonicalRunDirectory) !== canonicalRunsDirectory || basename(canonicalRunDirectory) !== basename(runDirectory)) throw new WorkflowError(code, `Run directory is outside the trusted runs directory: ${runDirectory}`);
+  const evidenceInfo = await lstat(directory).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
+  if (!evidenceInfo) return;
+  if (!evidenceInfo.isDirectory() || evidenceInfo.isSymbolicLink()) throw new WorkflowError(code, `Evidence directory is not a trusted regular directory: ${directory}`);
+  const canonicalEvidenceDirectory = await realpath(directory);
+  if (dirname(canonicalEvidenceDirectory) !== canonicalRunDirectory || basename(canonicalEvidenceDirectory) !== "evidence") throw new WorkflowError(code, `Evidence directory is outside the trusted run directory: ${directory}`);
+}
+async function assertEvidencePath(runsDirectoryPath: string, runDirectory: string, directory: string, path: string, code: "RESULT_INVALID" | "RESUME_INCOMPATIBLE"): Promise<void> {
+  if (!isAbsolute(path) || !piResourceContains(directory, path)) throw new WorkflowError(code, `Evidence artifact path escapes the run evidence directory: ${path}`);
+  await assertEvidenceDirectory(runsDirectoryPath, runDirectory, directory, code);
+  const info = await lstat(path).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) throw new WorkflowError(code, `Evidence artifact is missing: ${path}`); throw error; });
+  if (!info.isFile() || info.isSymbolicLink()) throw new WorkflowError(code, `Evidence artifact is not a regular file: ${path}`);
+  const [canonicalDirectory, canonicalFile] = await Promise.all([realpath(directory), realpath(path)]);
+  if (!piResourceContains(canonicalDirectory, canonicalFile)) throw new WorkflowError(code, `Evidence artifact path escapes the run evidence directory: ${path}`);
+}
+async function assertEvidenceFile(runsDirectoryPath: string, runDirectory: string, directory: string, path: string, sha256: string, bytes: number, code: "RESULT_INVALID" | "RESUME_INCOMPATIBLE"): Promise<void> {
+  await assertEvidencePath(runsDirectoryPath, runDirectory, directory, path, code);
+  const digest = await evidenceDigest(path);
+  if (digest.bytes !== bytes) throw new WorkflowError(code, `Evidence artifact byte count does not match its record: ${path}`);
+  if (digest.sha256 !== sha256) throw new WorkflowError(code, `Evidence artifact content does not match its checksum: ${path}`);
+}
+function evidenceUsage(journal: Journal): { count: number; bytes: number } {
+  let count = 0;
+  let bytes = 0;
+  for (const [path, operation] of Object.entries(journal.completed)) {
+    if (!path.startsWith("evidence/")) continue;
+    if (!object(operation.value) || typeof operation.value.sha256 !== "string" || typeof operation.value.bytes !== "number" || !Number.isSafeInteger(operation.value.bytes) || operation.value.bytes < 0) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${path}`);
+    count += 1;
+    bytes += operation.value.bytes;
+  }
+  return { count, bytes };
+}
+function containsEvidencePath(value: JsonValue, path: string): boolean {
+  if (typeof value === "string") return value === path;
+  if (Array.isArray(value)) return value.some((entry) => containsEvidencePath(entry, path));
+  return object(value) && Object.values(value).some((entry) => containsEvidencePath(entry, path));
 }
 function summaryArtifacts(directory: string): RunSummaryArtifacts { return { runDirectory: directory, statePath: join(directory, "state.json"), journalPath: join(directory, "journal.json"), snapshotPath: join(directory, "snapshot.json"), workflowPath: join(directory, "workflow.js"), resultPath: join(directory, "result.json"), summaryPath: join(directory, "summary.json"), evidenceDirectory: join(directory, "evidence") }; }
 function summaryFromRun(run: PersistedRun, directory: string, journal: Journal, previous: Partial<RunSummary> | undefined, fallbackCreatedAt: string, now = new Date().toISOString()): RunSummary {
@@ -64,7 +115,15 @@ export class RunStore {
   #assertRunIdentity(run: PersistedRun, code: WorkflowErrorCode, message: string): void {
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
   }
-
+  #evidenceDirectoryForPath(path: string): string {
+    const ownDirectory = this.evidenceDirectory();
+    const trustedRunsDirectory = runsDirectory(this.cwd, this.sessionId, this.home);
+    return piResourceContains(ownDirectory, path)
+      ? ownDirectory
+      : basename(dirname(path)) === "evidence" && piResourceContains(trustedRunsDirectory, path)
+        ? dirname(path)
+        : ownDirectory;
+  }
   async create(run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): Promise<void> {
     this.#assertRunIdentity(run, "INTERNAL_ERROR", "Run identity does not match its session-scoped store");
     const temporary = join(dirname(this.directory), `.${safePart(this.runId)}.${String(process.pid)}.${randomUUID()}.tmp`);
@@ -300,6 +359,40 @@ export class RunStore {
       return result;
     });
     return write;
+  }
+
+  private async commitEvidence(operation: string, record: EvidenceRecord, prepare: () => Promise<void>, rollback: () => Promise<void>): Promise<EvidenceRecord> {
+    return this.journalLane.run(async () => {
+      const journal = await this.#decodeJournal();
+      const existing = journal.completed[operation];
+      if (existing) {
+        const value = existing.value;
+        if (!object(value) || value.ref !== record.ref || value.sha256 !== record.sha256 || value.bytes !== record.bytes || typeof value.path !== "string" || basename(value.path) !== `${record.sha256}.txt`) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
+        await assertEvidenceFile(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, this.evidenceDirectory(), value.path, record.sha256, record.bytes, "RESUME_INCOMPATIBLE");
+        await rollback();
+        return record;
+      }
+      const usage = evidenceUsage(journal);
+      if (usage.count >= MAX_EVIDENCE_COUNT_PER_RUN || usage.bytes > MAX_EVIDENCE_BYTES_PER_RUN - record.bytes) throw new WorkflowError("RPC_LIMIT_EXCEEDED", "Run evidence exceeds its bounded artifact count or byte budget");
+      const previous = structuredClone(journal);
+      try {
+        await assertEvidenceDirectory(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, this.evidenceDirectory(), "RESULT_INVALID");
+        await prepare();
+        journal.awaiting ??= {};
+        journal.completed[operation] = { path: operation, value: { ref: record.ref, sha256: record.sha256, path: record.path, bytes: record.bytes } };
+        await atomicJson(join(this.directory, "journal.json"), journal);
+        this.refreshSummaryBestEffort();
+        return record;
+      } catch (error) {
+        await rollback().catch(() => undefined);
+        try {
+          const current = await this.#decodeJournal();
+          const value = current.completed[operation]?.value;
+          if (object(value) && value.path === record.path && value.sha256 === record.sha256 && value.bytes === record.bytes) await atomicJson(join(this.directory, "journal.json"), previous);
+        } catch { /* Preserve the original commit failure. */ }
+        throw error;
+      }
+    });
   }
 
   async complete(path: string, value: JsonValue): Promise<void> {
@@ -807,6 +900,10 @@ export class RunStore {
 
   evidenceDirectory(): string { return join(this.directory, "evidence"); }
 
+  async validateEvidenceDirectory(): Promise<void> {
+    await assertEvidenceDirectory(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, this.evidenceDirectory(), "RESULT_INVALID");
+  }
+
   /** Content-addressed and journaled by digest, so a resumed or retried run gets back the record its lineage first stored. */
   async saveEvidence(content: string | JsonValue): Promise<EvidenceRecord> {
     if (typeof content !== "string" && !jsonValue(content)) throw new WorkflowError("INVALID_METADATA", "Evidence content must be a string or JSON-compatible value");
@@ -819,46 +916,57 @@ export class RunStore {
     if (replayed) {
       const value = replayed.value;
       if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== raw.length || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt`) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
-      assertEvidenceIntegrity(await readFile(value.path), sha256, value.path);
+      const replayDirectory = this.#evidenceDirectoryForPath(value.path);
+      await assertEvidenceFile(runsDirectory(this.cwd, this.sessionId, this.home), dirname(replayDirectory), replayDirectory, value.path, sha256, raw.length, "RESULT_INVALID");
       return { ref, sha256, path: value.path, bytes: raw.length };
     }
     const dir = this.evidenceDirectory();
     const targetPath = join(dir, `${sha256}.txt`);
+    let created = false;
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const existing = await readFile(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
-    if (existing === undefined) await atomicWriteFile(targetPath, text);
-    else assertEvidenceIntegrity(existing, sha256, targetPath);
     const record = { ref, sha256, path: targetPath, bytes: raw.length };
-    // Identical content stored concurrently journals once; every caller returns the same record.
-    await this.updateJournal((journal) => { journal.completed[operation] ??= { path: operation, value: record }; });
-    return record;
+    return this.commitEvidence(operation, record, async () => {
+      const existing = await lstat(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
+      if (existing === undefined) { await atomicWriteFile(targetPath, text); created = true; }
+      else await assertEvidenceFile(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, dir, targetPath, sha256, raw.length, "RESULT_INVALID");
+    }, async () => { if (created) await rm(targetPath, { force: true }); });
   }
 
   /** Takes a streamed temporary file and commits it into the evidence store with checksum verification. */
   async saveEvidenceFile(tempPath: string, sha256: string, bytes: number): Promise<EvidenceRecord> {
+    if (!/^[0-9a-f]{64}$/.test(sha256) || !Number.isSafeInteger(bytes) || bytes < 0) throw new WorkflowError("INVALID_METADATA", "Evidence file metadata is invalid");
     const ref = `ref:sha256:${sha256.slice(0, 16)}`;
     const operation = structuralPath("evidence", sha256);
-    const replayed = await this.replay(operation);
-    if (replayed) {
-      const value = replayed.value;
-      if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== bytes || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt`) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
-      assertEvidenceIntegrity(await readFile(value.path), sha256, value.path);
-      await rm(tempPath, { force: true }).catch(() => undefined);
-      return { ref, sha256, path: value.path, bytes };
-    }
     const dir = this.evidenceDirectory();
     const targetPath = join(dir, `${sha256}.txt`);
+    let moved = false;
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const existing = await readFile(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
-    if (existing !== undefined) {
-      assertEvidenceIntegrity(existing, sha256, targetPath);
-      await rm(tempPath, { force: true }).catch(() => undefined);
-    } else {
-      await rename(tempPath, targetPath);
-    }
     const record = { ref, sha256, path: targetPath, bytes };
-    await this.updateJournal((journal) => { journal.completed[operation] ??= { path: operation, value: record }; });
-    return record;
+    return this.commitEvidence(operation, record, async () => {
+      await assertEvidenceFile(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, dir, tempPath, sha256, bytes, "RESULT_INVALID");
+      const existing = await lstat(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
+      if (existing !== undefined) {
+        await assertEvidenceFile(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, dir, targetPath, sha256, bytes, "RESULT_INVALID");
+        await rm(tempPath, { force: true });
+      } else { await rename(tempPath, targetPath); moved = true; }
+    }, async () => {
+      await rm(tempPath, { force: true });
+      if (moved) await rm(targetPath, { force: true });
+    });
+  }
+
+  async discardEvidence(record: EvidenceRecord): Promise<void> {
+    const operation = structuralPath("evidence", record.sha256);
+    await this.journalLane.run(async () => {
+      const journal = await this.#decodeJournal();
+      const entry = journal.completed[operation];
+      if (!entry || !object(entry.value) || entry.value.path !== record.path || entry.value.sha256 !== record.sha256 || entry.value.bytes !== record.bytes) return;
+      if (Object.entries(journal.completed).some(([path, current]) => path !== operation && containsEvidencePath(current.value, record.path))) return;
+      await rm(record.path, { force: true });
+      journal.completed = Object.fromEntries(Object.entries(journal.completed).filter(([path]) => path !== operation));
+      await atomicJson(join(this.directory, "journal.json"), journal);
+      this.refreshSummaryBestEffort();
+    });
   }
 
   async listEvidence(): Promise<readonly EvidenceRecord[]> {
@@ -871,11 +979,18 @@ export class RunStore {
       if (!/^[0-9a-f]{64}$/.test(sha256)) continue;
       const targetPath = join(dir, name);
       try {
-        const fileStat = await stat(targetPath);
+        const fileStat = await lstat(targetPath);
+        if (!fileStat.isFile() || fileStat.isSymbolicLink()) continue;
         results.push({ ref: `ref:sha256:${sha256.slice(0, 16)}`, sha256, path: targetPath, bytes: fileStat.size });
       } catch { /* Ignore concurrently removed files. */ }
     }
     return results;
+  }
+
+  async validateEvidenceRecord(record: EvidenceRecord, code: "RESULT_INVALID" | "RESUME_INCOMPATIBLE" = "RESULT_INVALID"): Promise<void> {
+    if (!object(record) || typeof record.ref !== "string" || typeof record.sha256 !== "string" || record.ref !== `ref:sha256:${record.sha256.slice(0, 16)}` || !/^[0-9a-f]{64}$/.test(record.sha256) || !Number.isSafeInteger(record.bytes) || record.bytes < 0 || typeof record.path !== "string" || basename(record.path) !== `${record.sha256}.txt`) throw new WorkflowError(code, "Evidence record is invalid");
+    const directory = this.#evidenceDirectoryForPath(record.path);
+    await assertEvidenceFile(runsDirectory(this.cwd, this.sessionId, this.home), dirname(directory), directory, record.path, record.sha256, record.bytes, code);
   }
 
   /**
@@ -890,10 +1005,12 @@ export class RunStore {
       if (!entry.isFile() || entry.isSymbolicLink()) throw new Error(`Evidence artifact is not a regular file: ${path}`);
       if (!/^[0-9a-f]{64}\.txt$/.test(entry.name)) throw new Error(`Evidence file name is invalid: ${path}`);
       // Taken before the read: a write during or after hashing changes ctime, so the next rescan rehashes.
+      await assertEvidencePath(runsDirectory(this.cwd, this.sessionId, this.home), this.directory, dir, path, "RESULT_INVALID");
       const info = await lstat(path, { bigint: true });
       const identity = `${String(info.dev)}:${String(info.ino)}:${String(info.size)}:${String(info.mtimeNs)}:${String(info.ctimeNs)}`;
       if (verified?.get(path) === identity) continue;
-      if (createHash("sha256").update(await readFile(path)).digest("hex") !== entry.name.slice(0, 64)) throw new Error(`Evidence artifact content does not match checksum: ${path}`);
+      const digest = await evidenceDigest(path);
+      if (digest.bytes !== Number(info.size) || digest.sha256 !== entry.name.slice(0, 64)) throw new Error(`Evidence artifact content or byte count is invalid: ${path}`);
       verified?.set(path, identity);
     }
   }

@@ -1,10 +1,10 @@
 import { fork, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID, type Hash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync, type WriteStream } from "node:fs";
+import { closeSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StringDecoder } from "node:string_decoder";
-import { RunStore, structuralPath as operationPath } from "./persistence.js";
+import { structuralPath as operationPath } from "./persistence.js";
+import type { RunStore } from "./persistence.js";
 import type { AgentAttempt } from "./agent-execution.js";
 import type { AgentIdentity, AgentAttemptSummary, EvidenceRecord, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, ToolIdentity, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
 import { WorkflowError, sumAccounting, zeroAccounting } from "./types.js";
@@ -12,6 +12,13 @@ import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCo
 import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions } from "./validation.js";
 
 export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
+export const SHELL_JOURNAL_THRESHOLD_BYTES = 64 * 1024;
+export const SHELL_TAIL_BYTES = 1024 * 1024;
+export const SHELL_ARTIFACT_STREAM_LIMIT_BYTES = 16 * 1024 * 1024;
+export const SHELL_ARTIFACT_TOTAL_LIMIT_BYTES = 24 * 1024 * 1024;
+const SHELL_INLINE_RESULT_LIMIT_BYTES = RPC_LIMIT_BYTES - 128 * 1024;
+type ShellEvidenceStore = Pick<RunStore, "evidenceDirectory" | "saveEvidenceFile" | "discardEvidence"> & { validateEvidenceDirectory?: () => Promise<void> };
+type ShellEvidenceStoreArgument = RunStore | string | ShellEvidenceStore;
 type WorkerErrorShape = { code?: string; message: string; authored?: boolean; failedAt?: string };
 export const HEARTBEAT_TIMEOUT_MS = 5000;
 type RpcMessage =
@@ -448,6 +455,7 @@ function isEvidenceRecord(value: unknown): value is EvidenceRecord {
 
 export function readShellResult(value: unknown): ShellResult {
   if (!object(value) || (value.exitCode !== null && !Number.isInteger(value.exitCode)) || typeof value.stdout !== "string" || typeof value.stderr !== "string") fail("SHELL_FAILED", "Shell bridge returned an invalid result");
+  if (value.truncated !== undefined && typeof value.truncated !== "boolean") fail("SHELL_FAILED", "Shell bridge returned invalid truncation metadata");
   if (value.stdoutEvidence !== undefined && !isEvidenceRecord(value.stdoutEvidence)) fail("SHELL_FAILED", "Shell bridge returned invalid stdout evidence");
   if (value.stderrEvidence !== undefined && !isEvidenceRecord(value.stderrEvidence)) fail("SHELL_FAILED", "Shell bridge returned invalid stderr evidence");
   if (value.evidence !== undefined && !isEvidenceRecord(value.evidence)) fail("SHELL_FAILED", "Shell bridge returned invalid evidence");
@@ -460,6 +468,7 @@ export function readShellResult(value: unknown): ShellResult {
     exitCode: value.exitCode as number | null,
     stdout: value.stdout,
     stderr: value.stderr,
+    ...(value.truncated === true ? { truncated: true } : {}),
     ...(value.stdoutBytes !== undefined ? { stdoutBytes: value.stdoutBytes as number } : {}),
     ...(value.stderrBytes !== undefined ? { stderrBytes: value.stderrBytes as number } : {}),
     ...(stdoutEvidence ? { stdoutEvidence } : {}),
@@ -488,14 +497,25 @@ function shellProcessKill(child: ChildProcess): void {
   forceKill = setTimeout(() => { forceKill = undefined; killProcessTree("SIGKILL"); }, 1000);
   forceKill.unref();
 }
+/** Shell output is journaled after the bounded inline threshold and replayed from evidence when needed. */
 export function executeShellCommand(
   command: string,
   options: ShellOptions,
   signal: AbortSignal,
   cwd = process.cwd(),
-  store?: RunStore | string,
+  evidenceStore?: ShellEvidenceStoreArgument,
 ): Promise<ShellResult> {
-  return new Promise((resolve, reject) => {
+  const evidenceDir = typeof evidenceStore === "string"
+    ? evidenceStore
+    : (evidenceStore ? evidenceStore.evidenceDirectory() : join(cwd, ".evidence"));
+  const requestedThreshold = typeof options.artifactThresholdBytes === "number" && options.artifactThresholdBytes > 0
+    ? options.artifactThresholdBytes
+    : (typeof options.artifact === "number" && options.artifact > 0 ? options.artifact : SHELL_JOURNAL_THRESHOLD_BYTES);
+  const thresholdBytes = Math.min(requestedThreshold, SHELL_ARTIFACT_STREAM_LIMIT_BYTES);
+  const validateEvidenceDirectory = typeof evidenceStore !== "string" && evidenceStore?.validateEvidenceDirectory
+    ? evidenceStore.validateEvidenceDirectory()
+    : Promise.resolve();
+  return validateEvidenceDirectory.then(() => new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
       child = spawn(command, {
@@ -510,83 +530,33 @@ export function executeShellCommand(
       return;
     }
 
-    const artifactMode = options.artifact === true
-      || (typeof options.artifact === "number" && options.artifact > 0)
-      || (typeof options.artifactThresholdBytes === "number" && options.artifactThresholdBytes > 0);
-    const thresholdBytes = typeof options.artifactThresholdBytes === "number" && options.artifactThresholdBytes > 0
-      ? options.artifactThresholdBytes
-      : (typeof options.artifact === "number" && options.artifact > 0 ? options.artifact : RPC_LIMIT_BYTES);
-
     let settled = false;
     let timedOut = false;
     let outputBytes = 0;
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
-    let stdout = "";
-    let stderr = "";
-
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
     let stdoutStream: WriteStream | undefined;
     let stderrStream: WriteStream | undefined;
-    let stdoutHash: Hash | undefined;
-    let stderrHash: Hash | undefined;
     let stdoutTempPath: string | undefined;
     let stderrTempPath: string | undefined;
-    let stdoutSpooled = false;
-    let stderrSpooled = false;
-
-    const evidenceDir = store instanceof RunStore
-      ? store.evidenceDirectory()
-      : (typeof store === "string" ? store : join(cwd, ".evidence"));
-
-    const ensureEvidenceDir = () => {
-      mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
-    };
-
-    const spoolStdout = () => {
-      if (stdoutSpooled) return;
-      stdoutSpooled = true;
-      ensureEvidenceDir();
-      stdoutTempPath = join(evidenceDir, `.tmp-stdout-${randomUUID()}`);
-      stdoutStream = createWriteStream(stdoutTempPath);
-      stdoutHash = createHash("sha256");
-      for (const c of stdoutChunks) {
-        stdoutHash.update(c);
-        stdoutStream.write(c);
-      }
-      stdoutChunks.length = 0;
-    };
-
-    const spoolStderr = () => {
-      if (stderrSpooled) return;
-      stderrSpooled = true;
-      ensureEvidenceDir();
-      stderrTempPath = join(evidenceDir, `.tmp-stderr-${randomUUID()}`);
-      stderrStream = createWriteStream(stderrTempPath);
-      stderrHash = createHash("sha256");
-      for (const c of stderrChunks) {
-        stderrHash.update(c);
-        stderrStream.write(c);
-      }
-      stderrChunks.length = 0;
-    };
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let spooled = false;
+    let cleanupRequested = false;
+    const committedEvidence: EvidenceRecord[] = [];
+    const committedLegacyPaths: string[] = [];
 
     const cleanupStreamsAndTimers = () => {
       if (timeout) clearTimeout(timeout);
       signal.removeEventListener("abort", onAbort);
     };
-
     const removeTempFiles = () => {
+      cleanupRequested = true;
       if (stdoutStream && !stdoutStream.destroyed) stdoutStream.destroy();
       if (stderrStream && !stderrStream.destroyed) stderrStream.destroy();
-      if (stdoutTempPath && existsSync(stdoutTempPath)) { try { rmSync(stdoutTempPath, { force: true }); } catch { /* best-effort cleanup */ } }
-      if (stderrTempPath && existsSync(stderrTempPath)) { try { rmSync(stderrTempPath, { force: true }); } catch { /* best-effort cleanup */ } }
+      for (const path of [stdoutTempPath, stderrTempPath]) if (path) { try { rmSync(path, { force: true }); } catch { /* best-effort cleanup */ } }
     };
-
     const failShell = (error: WorkflowError) => {
       if (settled) return;
       settled = true;
@@ -595,50 +565,113 @@ export function executeShellCommand(
       shellProcessKill(child);
       reject(error);
     };
-
     const onAbort = () => { failShell(new WorkflowError("CANCELLED", "Workflow cancelled")); };
+    const assertNotAborted = () => { if (signal.aborted) throw new WorkflowError("CANCELLED", "Workflow cancelled"); };
+    const onReadableError = (error: Error) => { failShell(new WorkflowError("SHELL_FAILED", errorText(error))); };
+    child.stdout?.once("error", onReadableError);
+    child.stderr?.once("error", onReadableError);
+
+    type ArtifactWriter = { stream: WriteStream; hash: Hash; path: string; bytes: number; readable: ChildProcess["stdout"] };
+    const writers: Partial<Record<"stdout" | "stderr", ArtifactWriter>> = {};
+    const ensureSpool = () => {
+      if (spooled) return;
+      spooled = true;
+      try {
+        mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+        for (const target of ["stdout", "stderr"] as const) {
+          const path = join(evidenceDir, `.tmp-shell-${target}-${randomUUID()}`);
+          const stream = createWriteStream(path);
+          stream.once("close", () => { if (cleanupRequested) { try { rmSync(path, { force: true }); } catch { /* best-effort cleanup */ } } });
+          const writer: ArtifactWriter = { stream, hash: createHash("sha256"), path, bytes: 0, readable: target === "stdout" ? child.stdout : child.stderr };
+          if (target === "stdout") stdoutTempPath = path; else stderrTempPath = path;
+          if (target === "stdout") stdoutStream = stream; else stderrStream = stream;
+          stream.on("error", (error) => { failShell(new WorkflowError("SHELL_FAILED", errorText(error))); });
+          stream.on("drain", () => { if (!settled) writer.readable?.resume(); });
+          writers[target] = writer;
+        }
+        for (const [target, chunks] of [["stdout", stdoutChunks], ["stderr", stderrChunks]] as const) {
+          const writer = writers[target];
+          if (!writer) continue;
+          for (const chunk of chunks) { writer.bytes += chunk.byteLength; writer.hash.update(chunk); if (!writer.stream.write(chunk)) writer.readable?.pause(); }
+          chunks.length = 0;
+        }
+      } catch (error) {
+        failShell(error instanceof WorkflowError ? error : new WorkflowError("SHELL_FAILED", errorText(error)));
+      }
+    };
 
     const capture = (target: "stdout" | "stderr", chunk: Buffer) => {
       if (settled) return;
       outputBytes += chunk.byteLength;
-      if (!artifactMode) {
-        if (outputBytes > RPC_LIMIT_BYTES) {
-          failShell(new WorkflowError("RPC_LIMIT_EXCEEDED", "Shell result exceeds the 10 MB JSON boundary"));
-          return;
-        }
-        if (target === "stdout") stdout += stdoutDecoder.write(chunk);
-        else stderr += stderrDecoder.write(chunk);
+      if (target === "stdout") stdoutBytes += chunk.byteLength; else stderrBytes += chunk.byteLength;
+      if ((target === "stdout" ? stdoutBytes : stderrBytes) > SHELL_ARTIFACT_STREAM_LIMIT_BYTES || outputBytes > SHELL_ARTIFACT_TOTAL_LIMIT_BYTES) {
+        failShell(new WorkflowError("RPC_LIMIT_EXCEEDED", "Shell output exceeds its bounded byte cap"));
         return;
       }
-
-      if (target === "stdout") {
-        stdoutBytes += chunk.byteLength;
-        if (!stdoutSpooled && (stdoutBytes > thresholdBytes || (outputBytes > thresholdBytes && stdoutBytes >= stderrBytes))) {
-          spoolStdout();
-        }
-        if (stdoutSpooled) {
-          stdoutHash?.update(chunk);
-          stdoutStream?.write(chunk);
-        } else {
-          stdoutChunks.push(chunk);
-        }
-      } else {
-        stderrBytes += chunk.byteLength;
-        if (!stderrSpooled && (stderrBytes > thresholdBytes || (outputBytes > thresholdBytes && stderrBytes >= thresholdBytes / 2))) {
-          spoolStderr();
-        }
-        if (stderrSpooled) {
-          stderrHash?.update(chunk);
-          stderrStream?.write(chunk);
-        } else {
-          stderrChunks.push(chunk);
-        }
+      if (!spooled) {
+        (target === "stdout" ? stdoutChunks : stderrChunks).push(chunk);
+        if (outputBytes > thresholdBytes) ensureSpool();
+        return;
       }
+      const writer = writers[target];
+      if (!writer) { failShell(new WorkflowError("SHELL_FAILED", "Shell artifact writer is unavailable")); return; }
+      writer.bytes += chunk.byteLength;
+      writer.hash.update(chunk);
+      if (!writer.stream.write(chunk)) writer.readable?.pause();
     };
 
     child.stdout?.on("data", (chunk: Buffer) => { capture("stdout", chunk); });
     child.stderr?.on("data", (chunk: Buffer) => { capture("stderr", chunk); });
     child.once("error", (error) => { failShell(new WorkflowError("SHELL_FAILED", errorText(error))); });
+
+    const finishWriter = (writer: ArtifactWriter): Promise<void> => new Promise((res, rej) => {
+      const onError = (error: Error) => { writer.stream.removeListener("error", onError); rej(error); };
+      writer.stream.once("error", onError);
+      writer.stream.end(() => { writer.stream.removeListener("error", onError); res(); });
+    });
+    const clearTempPath = (writer: ArtifactWriter) => {
+      if (writer.path === stdoutTempPath) stdoutTempPath = undefined;
+      if (writer.path === stderrTempPath) stderrTempPath = undefined;
+    };
+    const persistLegacyEvidence = (writer: ArtifactWriter, sha256: string): EvidenceRecord => {
+      const targetPath = join(evidenceDir, `${sha256}.txt`);
+      if (existsSync(targetPath)) rmSync(writer.path, { force: true });
+      else { renameSync(writer.path, targetPath); committedLegacyPaths.push(targetPath); }
+      clearTempPath(writer);
+      return { ref: `ref:sha256:${sha256.slice(0, 16)}`, sha256, path: targetPath, bytes: writer.bytes };
+    };
+    const finalizeWriter = async (writer: ArtifactWriter): Promise<EvidenceRecord | string> => {
+      await finishWriter(writer);
+      if (writer.bytes === 0) { rmSync(writer.path, { force: true }); clearTempPath(writer); return ""; }
+      if (writer.bytes <= thresholdBytes) {
+        const content = readFileSync(writer.path, "utf8");
+        rmSync(writer.path, { force: true });
+        clearTempPath(writer);
+        return content;
+      }
+      const sha256 = writer.hash.digest("hex");
+      const evidence = typeof evidenceStore === "string" || !evidenceStore
+        ? persistLegacyEvidence(writer, sha256)
+        : await evidenceStore.saveEvidenceFile(writer.path, sha256, writer.bytes);
+      if (typeof evidenceStore !== "string" && evidenceStore) committedEvidence.push(evidence);
+      clearTempPath(writer);
+      return evidence;
+    };
+    const readTail = (path: string, maxBytes: number): string => {
+      const size = statSync(path).size;
+      const start = Math.max(0, size - maxBytes - 4);
+      const length = size - start;
+      const fd = openSync(path, "r");
+      try {
+        const buffer = Buffer.alloc(length);
+        const read = readSync(fd, buffer, 0, length, start);
+        let text = buffer.subarray(0, read).toString("utf8");
+        while (text.startsWith("\uFFFD")) text = text.slice(1);
+        while (Buffer.byteLength(text, "utf8") > maxBytes) text = Array.from(text).slice(1).join("");
+        return text;
+      } finally { closeSync(fd); }
+    };
+    const textValue = (value: EvidenceRecord | string, truncated: boolean): string => typeof value === "string" ? value : truncated ? readTail(value.path, SHELL_TAIL_BYTES) : readFileSync(value.path, "utf8");
 
     child.once("close", (exitCode) => {
       void (async () => {
@@ -649,90 +682,42 @@ export function executeShellCommand(
         if (timedOut) { removeTempFiles(); reject(new WorkflowError("SHELL_FAILED", `Shell command timed out after ${String(options.timeoutMs)}ms`)); return; }
 
         try {
-          if (!artifactMode || (!stdoutSpooled && !stderrSpooled)) {
-            if (artifactMode) {
-              for (const c of stdoutChunks) stdout += stdoutDecoder.write(c);
-              stdout += stdoutDecoder.end();
-              for (const c of stderrChunks) stderr += stderrDecoder.write(c);
-              stderr += stderrDecoder.end();
-            } else {
-              stdout += stdoutDecoder.end();
-              stderr += stderrDecoder.end();
-              stdoutBytes = Buffer.byteLength(stdout);
-              stderrBytes = Buffer.byteLength(stderr);
-            }
-            const result: ShellResult = { exitCode: exitCode === null ? null : exitCode, stdout, stderr };
-            try { encodedRpcResult(Number.MAX_SAFE_INTEGER, result as unknown as JsonValue); } catch (error) { reject(error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error))); return; }
+          assertNotAborted();
+          if (!spooled) {
+            const result: ShellResult = {
+              exitCode: exitCode === null ? null : exitCode,
+              stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+              stderr: Buffer.concat(stderrChunks).toString("utf8"),
+            };
+            encodedRpcResult(Number.MAX_SAFE_INTEGER, result as unknown as JsonValue);
             resolve(result);
             return;
           }
 
-          await Promise.all([
-            new Promise<void>((res, rej) => {
-              if (!stdoutStream) { res(); return; }
-              stdoutStream.end(() => { res(); });
-              stdoutStream.on("error", rej);
-            }),
-            new Promise<void>((res, rej) => {
-              if (!stderrStream) { res(); return; }
-              stderrStream.end(() => { res(); });
-              stderrStream.on("error", rej);
-            }),
-          ]);
-
-          let stdoutEvidence: EvidenceRecord | undefined;
-          let stderrEvidence: EvidenceRecord | undefined;
-
-          if (stdoutSpooled && stdoutTempPath && stdoutHash && stdoutBytes > 0) {
-            const sha256 = stdoutHash.digest("hex");
-            if (store instanceof RunStore) {
-              stdoutEvidence = await store.saveEvidenceFile(stdoutTempPath, sha256, stdoutBytes);
-            } else {
-              const ref = `ref:sha256:${sha256.slice(0, 16)}`;
-              const targetPath = join(evidenceDir, `${sha256}.txt`);
-              if (existsSync(targetPath)) rmSync(stdoutTempPath, { force: true });
-              else renameSync(stdoutTempPath, targetPath);
-              stdoutEvidence = { ref, sha256, path: targetPath, bytes: stdoutBytes };
-            }
-          } else if (stdoutSpooled && stdoutTempPath) {
-            rmSync(stdoutTempPath, { force: true });
-          } else {
-            for (const c of stdoutChunks) stdout += stdoutDecoder.write(c);
-            stdout += stdoutDecoder.end();
-          }
-
-          if (stderrSpooled && stderrTempPath && stderrHash && stderrBytes > 0) {
-            const sha256 = stderrHash.digest("hex");
-            if (store instanceof RunStore) {
-              stderrEvidence = await store.saveEvidenceFile(stderrTempPath, sha256, stderrBytes);
-            } else {
-              const ref = `ref:sha256:${sha256.slice(0, 16)}`;
-              const targetPath = join(evidenceDir, `${sha256}.txt`);
-              if (existsSync(targetPath)) rmSync(stderrTempPath, { force: true });
-              else renameSync(stderrTempPath, targetPath);
-              stderrEvidence = { ref, sha256, path: targetPath, bytes: stderrBytes };
-            }
-          } else if (stderrSpooled && stderrTempPath) {
-            rmSync(stderrTempPath, { force: true });
-          } else {
-            for (const c of stderrChunks) stderr += stderrDecoder.write(c);
-            stderr += stderrDecoder.end();
-          }
-
+          const stdoutValue = await finalizeWriter(writers.stdout as ArtifactWriter);
+          assertNotAborted();
+          const stderrValue = await finalizeWriter(writers.stderr as ArtifactWriter);
+          assertNotAborted();
+          const stdoutEvidence = typeof stdoutValue === "string" ? undefined : stdoutValue;
+          const stderrEvidence = typeof stderrValue === "string" ? undefined : stderrValue;
           const evidence = stdoutEvidence ?? stderrEvidence;
+          const truncated = outputBytes > SHELL_INLINE_RESULT_LIMIT_BYTES;
           const result: ShellResult = {
             exitCode: exitCode === null ? null : exitCode,
-            stdout: stdoutEvidence ? "" : stdout,
-            stderr: stderrEvidence ? "" : stderr,
+            stdout: textValue(stdoutValue, truncated),
+            stderr: textValue(stderrValue, truncated),
+            ...(truncated ? { truncated: true } : {}),
             stdoutBytes,
             stderrBytes,
             ...(stdoutEvidence ? { stdoutEvidence } : {}),
             ...(stderrEvidence ? { stderrEvidence } : {}),
             ...(evidence ? { evidence } : {}),
           };
-          try { encodedRpcResult(Number.MAX_SAFE_INTEGER, result as unknown as JsonValue); } catch (error) { reject(error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error))); return; }
+          try { encodedRpcResult(Number.MAX_SAFE_INTEGER, result as unknown as JsonValue); } catch (error) { throw error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error)); }
           resolve(result);
         } catch (error) {
+          if (typeof evidenceStore !== "string") for (const evidence of committedEvidence.reverse()) await evidenceStore?.discardEvidence(evidence).catch(() => undefined);
+          for (const path of committedLegacyPaths) { try { rmSync(path, { force: true }); } catch { /* best-effort cleanup */ } }
           removeTempFiles();
           reject(error instanceof WorkflowError ? error : new WorkflowError("SHELL_FAILED", errorText(error)));
         }
@@ -741,7 +726,7 @@ export function executeShellCommand(
     if (signal.aborted) { onAbort(); return; }
     signal.addEventListener("abort", onAbort, { once: true });
     if (options.timeoutMs !== undefined) timeout = setTimeout(() => { timedOut = true; shellProcessKill(child); }, options.timeoutMs);
-  });
+  }));
 }
 /** The wire shape of a host-side failure: the code, the message, and the authored flag that tells the worker whether the text is safe to surface verbatim. */
 function workerErrorShape(typed: WorkflowError): WorkerErrorShape {

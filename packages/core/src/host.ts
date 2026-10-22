@@ -564,8 +564,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const replayed = await store.replay(path);
       if (replayed) {
         const replayedResult = readShellResult(replayed.value);
-        if (replayedResult.stdoutEvidence && !existsSync(replayedResult.stdoutEvidence.path)) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence artifact is missing: ${replayedResult.stdoutEvidence.path}`);
-        if (replayedResult.stderrEvidence && !existsSync(replayedResult.stderrEvidence.path)) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence artifact is missing: ${replayedResult.stderrEvidence.path}`);
+        const evidence = [replayedResult.stdoutEvidence, replayedResult.stderrEvidence, replayedResult.evidence].filter((record): record is NonNullable<typeof record> => record !== undefined);
+        for (const record of new Map(evidence.map((record) => [record.path, record])).values()) await store.validateEvidenceRecord(record, "RESUME_INCOMPATIBLE");
         return replayedResult;
       }
       const shellStartedAt = Date.now();
@@ -586,13 +586,18 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         return { ...current, activeShells: activeShells + 1, ...(activeShells > 0 && current.activeShellStartedAt !== undefined ? {} : { activeShellStartedAt: shellStartedAt }), activeShellsByPhase: nextPhaseActivities };
       });
       runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(started)));
+      let result: ShellResult | undefined;
       try {
         const cwd = identity.worktreeOwner ? (await persistWorktree(store, metadata, identity.worktreeOwner)).cwd : store.cwd;
-        const result = await executeShellCommand(command, options, signal, cwd, store);
+        result = await executeShellCommand(command, options, signal, cwd, store);
         if (!jsonValue(result)) fail("SHELL_FAILED", "Shell result is not JSON-compatible");
         await store.complete(path, result);
         return result;
       } catch (error) {
+        if (result) {
+          const evidence = [result.stdoutEvidence, result.stderrEvidence, result.evidence].filter((record): record is NonNullable<typeof record> => record !== undefined);
+          for (const record of new Map(evidence.map((record) => [record.path, record])).values()) await store.discardEvidence(record).catch(() => undefined);
+        }
         failure = asWorkflowError(error);
         throw error;
       } finally {

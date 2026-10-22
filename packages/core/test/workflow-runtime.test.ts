@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createReadToolDefinition } from "@earendil-works/pi-coding-agent";
 import { testExtensionApi, testExtensionContextFor } from "./support.js";
-import workflowExtension, { FairAgentScheduler, inspectWorkflowScript, preflight, RPC_LIMIT_BYTES, RunStore, runWorkflow, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { FairAgentScheduler, createLaunchSnapshot, inspectWorkflowScript, preflight, RPC_LIMIT_BYTES, RunStore, SHELL_ARTIFACT_STREAM_LIMIT_BYTES, runWorkflow, WorkflowError, type JsonValue } from "../src/index.js";
 import { listRunIds } from "../src/persistence.js";
 import { decodeOwnershipRecords } from "../src/decoders.js";
 import { readShellResult } from "../src/execution.js";
@@ -510,19 +510,107 @@ void test("production shell executes in the workflow cwd with merged environment
   const result = await workflow.execute("id", { name: "shell", script: "return await shell(\"node -e \\\"process.stdout.write(process.env.SHELL_TEST);process.stderr.write('err');process.exit(3)\\\"\", { env: { SHELL_TEST: \"yes\" } });", foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } });
   assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), { exitCode: 3, stdout: "yes", stderr: "err" });
 });
-void test("production shell does not journal results that exceed the complete RPC boundary", async () => {
+void test("production shell spills output before the RPC boundary and journals a compact replayable result", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-boundary-"));
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { value?: unknown } }> }> = [];
   workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} }), home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-boundary-cwd-"));
   const command = `node -e "process.stdout.write('x'.repeat(${String(RPC_LIMIT_BYTES - 80)}))"`;
-  await assert.rejects(workflow.execute("id", { name: "shell-boundary", script: `return await shell(${JSON.stringify(command)});`, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  const execution = await workflow.execute("id", { name: "shell-boundary", script: `return await shell(${JSON.stringify(command)});`, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const payload = execution;
+  const parsed = (payload.details?.value ?? JSON.parse(payload.content[0]?.text ?? "null")) as ShellResult;
+  assert.equal(parsed.exitCode, 0);
+  assert.equal(parsed.stdoutBytes, RPC_LIMIT_BYTES - 80);
+  assert.equal(parsed.truncated, true);
+  assert.ok(parsed.stdoutEvidence);
+  assert.ok(Buffer.byteLength(parsed.stdout) <= 1024 * 1024);
+  assert.match(parsed.stdout, /^x+$/);
+
   const [runId] = await listRunIds(cwd, "session", home);
   assert.ok(runId);
-  const journal = JSON.parse(readFileSync(join(new RunStore(cwd, "session", runId, home).directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
+  const store = new RunStore(cwd, "session", runId, home);
+  const journal = JSON.parse(readFileSync(join(store.directory, "journal.json"), "utf8")) as { completed: Record<string, { value: unknown }> };
+  const shellEntry = Object.values(journal.completed).find(({ value }) => typeof value === "object" && value !== null && "stdoutEvidence" in value);
+  assert.ok(shellEntry);
+  assert.ok(Buffer.byteLength(JSON.stringify(shellEntry.value)) < 2 * 1024 * 1024);
+  assert.equal((shellEntry.value as ShellResult).stdout, parsed.stdout);
+});
+
+void test("production artifact cap rejection cleans the journal and active-shell state", { skip: process.platform === "win32", timeout: 20_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-cap-public-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-cap-public-cwd-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} }), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const command = `${process.execPath} -e ${JSON.stringify(`process.stdout.write("X".repeat(${String(SHELL_ARTIFACT_STREAM_LIMIT_BYTES + 1)}))`)}`;
+  await assert.rejects(workflow.execute("id", { name: "artifact-cap", script: `return await shell(${JSON.stringify(command)}, { artifact: true, artifactThresholdBytes: 100 });`, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  const [runId] = await listRunIds(cwd, "session", home);
+  assert.ok(runId);
+  const store = new RunStore(cwd, "session", runId, home);
+  const run = (await store.load()).run;
+  const journal = JSON.parse(readFileSync(join(store.directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
+  assert.equal(run.activeShells, undefined);
   assert.deepEqual(journal.completed, {});
+  assert.deepEqual(existsSync(store.evidenceDirectory()) ? readdirSync(store.evidenceDirectory()) : [], []);
+});
+
+void test("production shell artifact rollback removes stdout evidence when stderr commit fails", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-rollback-public-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-rollback-public-cwd-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} }), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const original = Reflect.get(RunStore.prototype, "saveEvidenceFile");
+  let commits = 0;
+  RunStore.prototype.saveEvidenceFile = async function (tempPath: string, sha256: string, bytes: number) {
+    commits += 1;
+    if (commits === 2) throw new Error("second evidence commit failed");
+    return Reflect.apply(original, this, [tempPath, sha256, bytes]);
+  };
+  try {
+    const childScript = `process.stdout.write("O".repeat(200000)); setImmediate(() => process.stderr.write("E".repeat(200000)))`;
+    const command = `${process.execPath} -e ${JSON.stringify(childScript)}`;
+    const script = `return await shell(${JSON.stringify(command)}, { artifact: true, artifactThresholdBytes: 100 });`;
+    await assert.rejects(workflow.execute("id", { name: "artifact-rollback", script, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), WorkflowError);
+  } finally { RunStore.prototype.saveEvidenceFile = original; }
+  assert.equal(commits, 2);
+  const [runId] = await listRunIds(cwd, "session", home);
+  assert.ok(runId);
+  const store = new RunStore(cwd, "session", runId, home);
+  assert.deepEqual(await store.listEvidence(), []);
+  const journal = JSON.parse(readFileSync(join(store.directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
+  assert.deepEqual(Object.keys(journal.completed), []);
+  assert.equal((await store.load()).run.activeShells, undefined);
+});
+
+void test("production shell journal failure removes committed evidence", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-journal-cleanup-public-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-journal-cleanup-public-cwd-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} }), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const originalComplete = Reflect.get(RunStore.prototype, "complete");
+  RunStore.prototype.complete = async function (path: string, value: JsonValue) {
+    if (path.startsWith("shell/")) throw new Error("shell journal commit failed");
+    return Reflect.apply(originalComplete, this, [path, value]);
+  };
+  try {
+    const childScript = `process.stdout.write("O".repeat(200000)); setImmediate(() => process.stderr.write("E".repeat(200000)))`;
+    const command = `${process.execPath} -e ${JSON.stringify(childScript)}`;
+    await assert.rejects(workflow.execute("id", { name: "artifact-journal-cleanup", script: `return await shell(${JSON.stringify(command)}, { artifact: true, artifactThresholdBytes: 100 });`, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), WorkflowError);
+  } finally { RunStore.prototype.complete = originalComplete; }
+  const [runId] = await listRunIds(cwd, "session", home);
+  assert.ok(runId);
+  const store = new RunStore(cwd, "session", runId, home);
+  assert.deepEqual(await store.listEvidence(), []);
+  const journal = JSON.parse(readFileSync(join(store.directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
+  assert.deepEqual(Object.keys(journal.completed), []);
+  assert.equal((await store.load()).run.activeShells, undefined);
 });
 
 void test("production shell offloads oversized results to evidence store when artifact mode is enabled and allows bounded page reading", async () => {
@@ -533,11 +621,11 @@ void test("production shell offloads oversized results to evidence store when ar
   workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "read"], on() {} }), home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const lineCount = 11000;
+  const lineCount = 1000;
   const scriptContent = `const b = "A".repeat(1000); for (let i = 1; i <= ${String(lineCount)}; i++) process.stdout.write("line " + i + ": " + b + "\\n");`;
   const command = `${process.execPath} -e ${JSON.stringify(scriptContent)}`;
   const workflowScript = `
-    const result = await shell(${JSON.stringify(command)}, { artifact: true });
+    const result = await shell(${JSON.stringify(command)}, { artifact: true, artifactThresholdBytes: 100 });
     const page1 = await tools.read({ path: result.stdoutEvidence.path, offset: 1, limit: 5 });
     const page2 = await tools.read({ path: result.stdoutEvidence.path, offset: 6, limit: 5 });
     return {
@@ -569,7 +657,7 @@ void test("production shell offloads oversized results to evidence store when ar
   const parsed = executionValue as { exitCode: number; hasStdoutEvidence: boolean; evidenceBytes: number; evidenceRef: string; path: string; stdoutBytes: number; page1: string; page2: string };
   assert.equal(parsed.exitCode, 0);
   assert.equal(parsed.hasStdoutEvidence, true);
-  assert.ok(parsed.evidenceBytes > RPC_LIMIT_BYTES);
+  assert.ok(parsed.evidenceBytes > 100);
   assert.equal(parsed.stdoutBytes, parsed.evidenceBytes);
   assert.match(parsed.evidenceRef, /^ref:sha256:[0-9a-f]{16}$/);
   assert.ok(existsSync(parsed.path));
@@ -598,13 +686,13 @@ void test("production shell replays artifact-backed shell from journal without r
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-replay-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-artifact-replay-cwd-"));
   const marker = join(cwd, "marker.txt");
-  const scriptContent = `const fs = require("node:fs"); fs.appendFileSync(${JSON.stringify(marker)}, "ran\\n"); process.stdout.write("A".repeat(${String(RPC_LIMIT_BYTES + 512)}))`;
+  const scriptContent = `const fs = require("node:fs"); fs.appendFileSync(${JSON.stringify(marker)}, "ran\\n"); process.stdout.write("A".repeat(262144))`;
   const command = `${process.execPath} -e ${JSON.stringify(scriptContent)}`;
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
   workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} }), home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const workflowScript = `return await shell(${JSON.stringify(command)}, { artifact: true });`;
+  const workflowScript = `return await shell(${JSON.stringify(command)}, { artifact: true, artifactThresholdBytes: 100 });`
   const first = await workflow.execute("first", { name: "replay-shell", script: workflowScript, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   const firstPayload = first as { content: Array<{ text: string }>; details?: { value?: unknown } };
   const firstValue: unknown = firstPayload.details?.value ?? (JSON.parse(first.content[0]?.text ?? "null") as unknown);
@@ -615,12 +703,33 @@ void test("production shell replays artifact-backed shell from journal without r
   const [runId] = await listRunIds(cwd, "session", home);
   assert.ok(runId);
   const store = new RunStore(cwd, "session", runId, home);
+  const evidenceRecord = firstParsed.stdoutEvidence;
+  assert.ok(evidenceRecord);
+  const originalEvidence = readFileSync(evidenceRecord.path);
+  writeFileSync(evidenceRecord.path, "tampered");
+  await assert.rejects(store.validateEvidenceRecord(evidenceRecord, "RESUME_INCOMPATIBLE"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  rmSync(evidenceRecord.path);
+  await assert.rejects(store.validateEvidenceRecord(evidenceRecord, "RESUME_INCOMPATIBLE"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  writeFileSync(evidenceRecord.path, originalEvidence);
+  await assert.rejects(store.validateEvidenceRecord({ ...evidenceRecord, path: join(cwd, "outside.txt") }, "RESUME_INCOMPATIBLE"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   const operations = await store.replayableOperations();
   const shellOp = operations.find((op) => op.path.startsWith("shell/"));
   assert.ok(shellOp);
   const replayed = readShellResult(shellOp.value);
   assert.deepEqual(replayed.stdoutEvidence, firstParsed.stdoutEvidence);
   assert.equal(readFileSync(marker, "utf8"), "ran\n");
+});
+
+void test("replay rejects evidence paths through a symlinked run directory", { skip: process.platform === "win32" }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-symlink-run-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-symlink-run-cwd-"));
+  const store = new RunStore(cwd, "session", "run", home);
+  await store.create({ id: "run", workflowName: "symlink-run", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return 1", args: null, metadata: { name: "symlink-run" }, settings: { concurrency: 1 }, models: [], tools: [], agentConfigurations: {}, schemas: [] }));
+  const record = await store.saveEvidence("trusted");
+  const realRunDirectory = join(join(store.directory, ".."), "real-run");
+  renameSync(store.directory, realRunDirectory);
+  symlinkSync(realRunDirectory, store.directory, "dir");
+  await assert.rejects(store.validateEvidenceRecord({ ...record, path: join(store.directory, "evidence", `${record.sha256}.txt`) }, "RESUME_INCOMPATIBLE"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
 });
 
 void test("unawaited agent, shell, and function results refuse serialization and interpolation with a typed error", async () => {

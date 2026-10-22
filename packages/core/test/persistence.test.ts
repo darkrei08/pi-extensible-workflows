@@ -7,7 +7,7 @@ import { join, relative } from "node:path";
 import test from "node:test";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
 import { atomicWriteFile } from "../src/io.js";
-import { hasLiveSessionLease, listRunIds, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
+import { hasLiveSessionLease, listRunIds, MAX_EVIDENCE_COUNT_PER_RUN, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
 import { callUnchecked, decodeTestJsonRecord, isTestRecord } from "./support.js";
 
 const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',description:'x'}", args: { answer: 42 }, metadata: { name: "x", description: "x" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] });
@@ -984,6 +984,16 @@ void test("concurrent identical evidence journals one content-addressed operatio
   assert.deepEqual(operations, [{ path: structuralPath("evidence", first.sha256), value: { ...first } }]);
 });
 
+void test("serializes unique evidence commits under the per-run count budget", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-budget-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  await Promise.all(Array.from({ length: MAX_EVIDENCE_COUNT_PER_RUN }, (_, index) => store.saveEvidence(`unique-${String(index)}`)));
+  await assert.rejects(store.saveEvidence("one-too-many"), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  assert.equal((await store.listEvidence()).length, MAX_EVIDENCE_COUNT_PER_RUN);
+});
+
 void test("saveEvidenceFile commits temporary files, deduplicates, and journals operation", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-file-"));
   const cwd = join(home, "project");
@@ -994,7 +1004,8 @@ void test("saveEvidenceFile commits temporary files, deduplicates, and journals 
   const payload = "Streamed evidence content";
   const bytes = Buffer.byteLength(payload, "utf8");
   const sha256 = createHash("sha256").update(Buffer.from(payload, "utf8")).digest("hex");
-  const tempPath = join(cwd, "stream.tmp");
+  const tempPath = join(store.evidenceDirectory(), "stream.tmp");
+  mkdirSync(store.evidenceDirectory(), { recursive: true });
   writeFileSync(tempPath, payload);
 
   const record = await store.saveEvidenceFile(tempPath, sha256, bytes);
@@ -1004,7 +1015,7 @@ void test("saveEvidenceFile commits temporary files, deduplicates, and journals 
   assert.ok(existsSync(record.path));
   assert.equal(existsSync(tempPath), false);
 
-  const tempPath2 = join(cwd, "stream2.tmp");
+  const tempPath2 = join(store.evidenceDirectory(), "stream2.tmp");
   writeFileSync(tempPath2, payload);
   const record2 = await store.saveEvidenceFile(tempPath2, sha256, bytes);
   assert.deepEqual(record2, record);
