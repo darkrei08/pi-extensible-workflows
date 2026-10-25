@@ -574,10 +574,14 @@ void test("CLI TTY progress preserves log history when a shell row is inserted",
         input: { type: "object", additionalProperties: false },
         output: { type: "boolean" },
         run: async (_input, context) => {
-          context.log(Array.from({ length: 8 }, (_, index) => `record-${String(index)}`).join("\n"));
+          for (let index = 0; index < 10; index += 1) context.phase(`phase-${String(index)}`);
           await new Promise<void>((resolve) => setTimeout(resolve, 100));
-          await context.shell("sleep 0.3");
-          await context.shell("sleep 0.3");
+          const firstShell = context.shell("sleep 0.6");
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          for (let index = 0; index < 5; index += 1) context.log(`record-${String(index)}`);
+          await firstShell;
+          const secondShell = context.shell("sleep 0.6");
+          await secondShell;
           return true;
         },
       },
@@ -594,7 +598,8 @@ void test("CLI TTY progress preserves log history when a shell row is inserted",
   }
   const terminal = emulateTerminal(stderr, 5);
   const finalOutput = [...terminal.history, ...terminal.screen];
-  for (let index = 3; index < 8; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`record-${String(index)}`)).length, 1, finalOutput.join("\n"));
+  for (let index = 0; index < 5; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`record-${String(index)}`)).length, 1, finalOutput.join("\n"));
+  for (let index = 0; index < 10; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`[Phase: phase-${String(index)}]`)).length, 1, finalOutput.join("\n"));
 });
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();

@@ -486,7 +486,7 @@ class CliProgress {
       const text = lines.slice(-visibleLines).join("\n");
       this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, visibleRows))}A` : ""}\x1b[0J${text}\n`);
     } else {
-      const appended = lines.length > this.#previousLines.length && this.#previousLines.slice(1).every((line, index) => line === lines[index + 1]);
+      const appended = lines.length > this.#previousLines.length && this.#previousLines.every((line, index) => line === lines[index] || index === 0 || (line.includes("[running]") && lines[index]?.includes("[running]")));
       const changed = lines.slice(0, this.#previousLines.length).reduce<number[]>((indices, line, index) => {
         if (line !== this.#previousLines[index]) indices.push(index);
         return indices;
