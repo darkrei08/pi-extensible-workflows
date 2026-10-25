@@ -13,6 +13,7 @@ const htmlAsset = readFileSync(new URL("../src/assets/semantic-map.html", import
 const jsAsset = readFileSync(new URL("../src/assets/semantic-map.js", import.meta.url));
 const cssAsset = readFileSync(new URL("../src/assets/semantic-map.css", import.meta.url));
 const fixtureScript = `<script>
+window.addEventListener('error', function (event) { window.__semanticMapError = event.message; });
 document.addEventListener('DOMContentLoaded', function () {
   var scope = { publisherId: 'browser', targetKind: 'run', targetId: 'run-browser' };
   var nodes = [
@@ -44,15 +45,24 @@ async function listen(server: ReturnType<typeof createServer>): Promise<number> 
 }
 async function runChrome(url: string, profile: string, callback: (evaluate: (expression: string) => Promise<unknown>) => Promise<void>): Promise<void> {
   assert.ok(chrome);
-  const portProbe = createServer(); const port = await listen(portProbe); await new Promise<void>((resolve) => { portProbe.close(() => { resolve(); }); });
-  const child = spawn(chrome, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", `--remote-debugging-port=${String(port)}`, `--user-data-dir=${profile}`, url], { stdio: "ignore" });
+  // Let Chrome bind its own port, as in the Trajectory browser suite.
+  const child = spawn(chrome, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, url], { stdio: ["ignore", "ignore", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-4000); });
   let socket: WebSocket | undefined;
   try {
     let endpoint: string | undefined;
-    for (let attempt = 0; attempt < 200 && !endpoint; attempt += 1) {
-      try { const pages = await (await fetch(`http://127.0.0.1:${String(port)}/json`)).json() as Array<{ type?: string; webSocketDebuggerUrl?: string }>; endpoint = pages.find((page) => page.type === "page")?.webSocketDebuggerUrl; } catch { await wait(50); }
+    const deadline = Date.now() + 30_000;
+    let browserEndpoint: string | undefined;
+    while (!endpoint && child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
+      browserEndpoint ??= /DevTools listening on (ws:\/\/\S+)/.exec(stderr)?.[1];
+      if (browserEndpoint) {
+        try { const pages = await (await fetch(`http://${new URL(browserEndpoint).host}/json`, { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) })).json() as Array<{ type?: string; webSocketDebuggerUrl?: string }>; endpoint = pages.find((page) => page.type === "page")?.webSocketDebuggerUrl; } catch { /* The page target is not listed yet. */ }
+      }
+      if (!endpoint) await wait(50);
     }
-    assert.ok(endpoint, "Chrome DevTools endpoint did not start");
+    assert.ok(endpoint, `Chrome DevTools endpoint did not start within 30000 ms (pid ${String(child.pid)}, exit ${String(child.exitCode)}, signal ${String(child.signalCode)}, endpoint ${browserEndpoint ?? "not announced"}): ${stderr}`);
     socket = new WebSocket(endpoint);
     await new Promise<void>((resolve, reject) => { socket?.addEventListener("open", () => { resolve(); }, { once: true }); socket?.addEventListener("error", () => { reject(new Error("Chrome DevTools connection failed")); }, { once: true }); });
     const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>(); let nextId = 1;
@@ -61,7 +71,7 @@ async function runChrome(url: string, profile: string, callback: (evaluate: (exp
     await evaluate("void 0");
     for (let attempt = 0; attempt < 100; attempt += 1) { if (await evaluate("Boolean(window.__semanticMapCase)")) break; await wait(25); }
     const result = await evaluate("window.__semanticMapCase");
-    assert.ok(result && typeof result === "object");
+    assert.ok(result && typeof result === "object", `Semantic Map fixture did not initialize: ${String(await evaluate("window.__semanticMapError"))}`);
     await callback(evaluate);
   } finally {
     socket?.close(); child.kill("SIGTERM");

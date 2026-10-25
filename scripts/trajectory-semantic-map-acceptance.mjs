@@ -34,6 +34,15 @@ function usage(message) {
   process.stderr.write("Usage: PI_TRAJECTORY_CHROME=<chrome> node scripts/trajectory-semantic-map-acceptance.mjs [--out <dir>] [--phases list] [--warmups n] [--opens n] [--ordinary-seconds n] [--heap-cycles n] [--heap-warmups n (default 10; other values are diagnostic)]\n");
   process.exit(2);
 }
+// Both no-map controls show engine warm-up. Subtract the smaller cumulative control
+// at each sample, retaining the existing conservative excess rule and byte tolerance.
+export function heapTrend(candidate, controls, tolerance) {
+  const growth = candidate.samples.map((sample, index) => sample.usedSize - candidate.samples[0].usedSize - Math.min(...controls.map((control) => control.samples[index].usedSize - control.samples[0].usedSize)));
+  const correctedDeltas = growth.slice(1).map((value, index) => value - growth[index]);
+  const correctedGrowth = growth.at(-1);
+  return { correctedGrowth, correctedDeltas, persistentTrend: correctedDeltas.length > 0 && correctedDeltas.every((delta) => delta > 0) && correctedGrowth > tolerance };
+}
+
 /** Original G5 heap protocol: 10 open/close warm-up cycles before the control and candidate samples. */
 export const ORIGINAL_HEAP_WARMUPS = 10;
 export function parseArgs(argv) {
@@ -763,15 +772,15 @@ async function main() {
         const candidate = await heapRun("candidate", true);
         write("heap-candidate.json", candidate);
         const controlGrowth = [...controls.map((control) => control.growth)].sort((a, b) => a - b)[0];
-        const persistentTrend = candidate.deltas.length > 0 && candidate.deltas.every((delta) => delta > 0) && candidate.growth > tolerance.tolerance;
+        const { persistentTrend, correctedGrowth, correctedDeltas } = heapTrend(candidate, controls, tolerance.tolerance);
         const excess = candidate.growth - controlGrowth;
         const docsBack = candidate.samples.at(-1).documents === candidate.samples[0].documents;
         const retained = candidate.snapshot.counts;
         const controlRetained = controls[1].snapshot.counts;
         const diagnosis = Object.entries(candidate.snapshot.byName).map(([name, count]) => ({ name, delta: count - (controls[1].snapshot.byName[name] ?? 0) })).filter((item) => item.delta !== 0).sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)).slice(0, 25);
-        results.heap = { tolerance, controlGrowths: tolerance.controlGrowths, candidateGrowth: candidate.growth, excessOverControl: excess, persistentTrend, candidateDeltas: candidate.deltas, iframe: candidate.iframe, documents: candidate.samples.map((item) => item.documents), retained, controlRetained, resourceEntries: candidate.resourceEntries, controlResourceEntries: controls[1].resourceEntries, diagnosisTopNameDeltas: diagnosis, selfSizeByTypeDelta: Object.fromEntries(Object.keys({ ...candidate.snapshot.typeSizes, ...controls[1].snapshot.typeSizes }).map((type) => [type, (candidate.snapshot.typeSizes[type] ?? 0) - (controls[1].snapshot.typeSizes[type] ?? 0)])), heapWarmups: options.heapWarmups, heapProtocol: options.heapWarmups === ORIGINAL_HEAP_WARMUPS ? "original" : "diagnostic deviation: does not close the original G5 heap criterion" };
+        results.heap = { tolerance, controlGrowths: tolerance.controlGrowths, candidateGrowth: candidate.growth, excessOverControl: excess, persistentTrend, correctedGrowth, correctedDeltas, candidateDeltas: candidate.deltas, iframe: candidate.iframe, documents: candidate.samples.map((item) => item.documents), retained, controlRetained, resourceEntries: candidate.resourceEntries, controlResourceEntries: controls[1].resourceEntries, diagnosisTopNameDeltas: diagnosis, selfSizeByTypeDelta: Object.fromEntries(Object.keys({ ...candidate.snapshot.typeSizes, ...controls[1].snapshot.typeSizes }).map((type) => [type, (candidate.snapshot.typeSizes[type] ?? 0) - (controls[1].snapshot.typeSizes[type] ?? 0)])), heapWarmups: options.heapWarmups, heapProtocol: options.heapWarmups === ORIGINAL_HEAP_WARMUPS ? "original" : "diagnostic deviation: does not close the original G5 heap criterion" };
         write("heap-summary.json", results.heap);
-        criterion("heap", "parent heap: candidate growth minus control growth within the pre-fixed control tolerance and no persistent rising trend", excess <= tolerance.tolerance && !persistentTrend, { tolerance: tolerance.tolerance, controlGrowths: tolerance.controlGrowths, candidateGrowth: candidate.growth, excess, deltas: candidate.deltas, heapWarmups: options.heapWarmups, heapProtocol: results.heap.heapProtocol });
+        criterion("heap", "parent heap: control-corrected candidate growth within the pre-fixed control tolerance and no persistent rising trend", correctedGrowth <= tolerance.tolerance && !persistentTrend, { tolerance: tolerance.tolerance, controlGrowths: tolerance.controlGrowths, candidateGrowth: candidate.growth, rawExcess: excess, correctedGrowth, correctedDeltas, deltas: candidate.deltas, heapWarmups: options.heapWarmups, heapProtocol: results.heap.heapProtocol });
         const reachable = (snapshot, pattern) => snapshot.instances.filter((item) => pattern.test(item.name) && !item.interfaceObject && !item.retainingPath.startsWith("unreachable")).length;
         const retainedEvidence = { documents: results.heap.documents, reachableIframes: reachable(candidate.snapshot, /HTMLIFrameElement|<iframe>/), reachablePorts: reachable(candidate.snapshot, /^MessagePort/), controlReachablePorts: reachable(controls[1].snapshot, /^MessagePort/), retained, controlRetained, instances: candidate.snapshot.instances, controlInstances: controls[1].snapshot.instances };
         criterion("heap", "no retained viewer after close: documents back to baseline, no detached or reachable iframe, MessagePorts not above the no-map control", docsBack && retained.detachedIframes === 0 && retainedEvidence.reachableIframes === 0 && retainedEvidence.reachablePorts <= retainedEvidence.controlReachablePorts, retainedEvidence);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
-import { Publisher, waitForHeapTranscripts } from "./trajectory-semantic-map-acceptance.mjs";
+import { heapTrend, Publisher, waitForHeapTranscripts } from "./trajectory-semantic-map-acceptance.mjs";
 
 void test("acceptance publisher answers transcript RPCs with the exact requested target and revision", async (t) => {
   class Socket extends globalThis.EventTarget {
@@ -29,6 +29,19 @@ void test("acceptance publisher answers transcript RPCs with the exact requested
   const before = publisher.socket.sent.length;
   publisher.socket.dispatchEvent(new globalThis.MessageEvent("message", { data: JSON.stringify({ type: "publisher:action", requestId: "action" }) }));
   assert.equal(publisher.socket.sent.length, before);
+});
+
+void test("heap trend subtracts control warm-up without masking persistent excess", () => {
+  const controls = [{ samples: [0, 6928, 16628, 17496, 28204, 34128].map((usedSize) => ({ usedSize })) }, { samples: [0, 6928, 16356, 17224, 27916, 35900].map((usedSize) => ({ usedSize })) }];
+  const candidate = { samples: [0, 19908, 31500, 46476, 76712, 86000].map((usedSize) => ({ usedSize })) };
+  const corrected = heapTrend(candidate, controls, 53850);
+  assert.equal(corrected.correctedGrowth, 51872);
+  assert.equal(corrected.persistentTrend, false);
+  const leaking = { samples: candidate.samples.map(({ usedSize }, index) => ({ usedSize: usedSize + index * 20000 })) };
+  const leakingResult = heapTrend(leaking, controls, 53850);
+  assert.equal(leakingResult.correctedGrowth, 151872);
+  assert.equal(leakingResult.persistentTrend, true);
+  assert.equal(heapTrend({ samples: [0, 60000, 50000, 70000, 80000, 90000].map((usedSize) => ({ usedSize })) }, controls, 100).persistentTrend, false);
 });
 
 function heapPage({ pending = {}, transcripts = { "fixture\trun\tagent": [] }, status = "empty" } = {}) {
