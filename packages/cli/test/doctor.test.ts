@@ -564,6 +564,38 @@ void test("CLI TTY progress keeps an oversized block inside the terminal viewpor
   for (let index = 0; index < 10; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`[Phase: phase-${String(index)}]`)).length, 1, finalOutput.join("\n"));
   assert.ok(terminal.screen.some((line) => line.includes("[Phase: phase-9]")), terminal.screen.join("\n"));
 });
+void test("CLI TTY progress preserves log history when a shell row is inserted", async () => {
+  registerWorkflowExtension({
+    version: "1.0.0",
+    headline: "CLI inserted progress test",
+    functions: {
+      cliInsertedProgress: {
+        description: "Render log history while shell activity starts",
+        input: { type: "object", additionalProperties: false },
+        output: { type: "boolean" },
+        run: async (_input, context) => {
+          context.log(Array.from({ length: 8 }, (_, index) => `record-${String(index)}`).join("\n"));
+          await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          await context.shell("sleep 0.3");
+          await context.shell("sleep 0.3");
+          return true;
+        },
+      },
+    },
+  });
+  const paths = fixture();
+  let stderr = "";
+  const previousRows = process.stderr.rows;
+  Object.defineProperty(process.stderr, "rows", { configurable: true, value: 5 });
+  try {
+    assert.equal(await runCli(["run", "cliInsertedProgress"], { cwd: paths.cwd, agentDir: paths.agentDir, isTTY: true, stderr: (text) => { stderr += text; } }, () => {}), 0);
+  } finally {
+    Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows });
+  }
+  const terminal = emulateTerminal(stderr, 5);
+  const finalOutput = [...terminal.history, ...terminal.screen];
+  for (let index = 3; index < 8; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`record-${String(index)}`)).length, 1, finalOutput.join("\n"));
+});
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();
   const paths = fixture();
