@@ -429,6 +429,8 @@ function terminalProgressStyles(enabled: boolean): WorkflowProgressStyles {
 class CliProgress {
   #lastStable = "";
   #lines = 0;
+  #previousLines: string[] = [];
+  #rows = 0;
   #frame = 0;
   #run: PersistedRun | undefined;
   #runId: string | undefined;
@@ -472,13 +474,40 @@ class CliProgress {
     }
     const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame++ % 10] ?? "◇";
     const width = process.stderr.columns || 80;
-    const text = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles), width).join("\n");
-    this.stderr(`${this.#lines ? `\x1b[${String(this.#lines)}A` : ""}${this.#lines ? "" : "\x1b[?25l"}\x1b[0J${text}\n`);
-    this.#lines = text.split("\n").length;
+    const rows = Math.max(1, process.stderr.rows || 24);
+    const lines = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles), width);
+    const resized = this.#rows !== 0 && this.#rows !== rows;
+    const visibleLimit = resized ? Math.min(this.#lines, rows) : rows;
+    const visibleLines = Math.min(lines.length, Math.max(1, visibleLimit));
+    if (!this.#previousLines.length) {
+      this.stderr(`\x1b[?25l\x1b[0J${lines.join("\n")}\n`);
+    } else if (lines.length < this.#previousLines.length) {
+      const text = lines.slice(-visibleLines).join("\n");
+      this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, rows))}A` : ""}\x1b[0J${text}\n`);
+    } else {
+      const appended = lines.length > this.#previousLines.length;
+      const changed = lines.slice(0, this.#previousLines.length).reduce<number[]>((indices, line, index) => {
+        if (line !== this.#previousLines[index]) indices.push(index);
+        return indices;
+      }, []);
+      let output = appended ? lines.slice(this.#previousLines.length).map((line) => `${line}\n`).join("") : "";
+      const first = changed.find((index) => index >= lines.length - visibleLines);
+      if (first !== undefined) {
+        const last = changed.at(-1) ?? first;
+        output += `\x1b[${String(lines.length - first)}A`;
+        for (let index = first; index <= last; index += 1) output += `\r\x1b[2K${lines[index] ?? ""}\n`;
+        const down = lines.length - last - 1;
+        if (down > 0) output += `\x1b[${String(down)}B`;
+      }
+      if (output) this.stderr(output);
+    }
+    this.#previousLines = lines;
+    this.#rows = rows;
+    this.#lines = visibleLines;
   }
   finish(): void {
     if (this.#timer) { clearInterval(this.#timer); this.#timer = undefined; }
-    if (this.#interactive && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
+    if (this.#interactive && this.#lines) { this.stderr(`\x1b[${String(Math.min(this.#lines, process.stderr.rows || this.#rows || 24))}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
     this.#run = undefined;
   }
 }

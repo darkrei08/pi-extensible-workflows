@@ -14,7 +14,7 @@ import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
 import { formatWorkflowCliHelp, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { WorkflowRegistry } from "pi-extensible-workflows";
+import { registerWorkflowExtension, WorkflowRegistry } from "pi-extensible-workflows";
 
 import { isCliTestBundleExtension, isCliTestBundleModule, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
 import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
@@ -492,6 +492,36 @@ void test("CLI TTY progress repaints and respects terminal width", async () => {
   assert.ok(stderr.includes("\u001b[?25l"));
   assert.ok(stderr.includes("\u001b[1A"));
   assert.match(stderr, /…/);
+});
+void test("CLI TTY progress keeps an oversized block inside the terminal viewport", async () => {
+  registerWorkflowExtension({
+    version: "1.0.0",
+    headline: "CLI tall progress test",
+    functions: {
+      cliTallProgress: {
+        description: "Render more phases than the terminal can show",
+        input: { type: "object", additionalProperties: false },
+        output: { type: "boolean" },
+        run: async (_input, context) => {
+          for (let index = 0; index < 10; index += 1) context.phase(`phase-${String(index)}`);
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+          return true;
+        },
+      },
+    },
+  });
+  const paths = fixture();
+  let stderr = "";
+  const previousRows = process.stderr.rows;
+  Object.defineProperty(process.stderr, "rows", { configurable: true, value: 5 });
+  try {
+    assert.equal(await runCli(["run", "cliTallProgress"], { cwd: paths.cwd, agentDir: paths.agentDir, isTTY: true, stderr: (text) => { stderr += text; } }, () => {}), 0);
+  } finally {
+    Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows });
+  }
+  const cursorMoves = [...stderr.matchAll(new RegExp(`${String.fromCharCode(27)}\\[(\\d+)A`, "g"))].map((match) => Number(match[1]));
+  assert.match(stderr, /phase-9/);
+  assert.ok(cursorMoves.every((lines) => lines <= 5), stderr);
 });
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();
