@@ -29,7 +29,7 @@ async function waitFor(page: Devtools, expression: string): Promise<void> {
 function findBrowser(): string | undefined {
   const configured = process.env.PI_TRAJECTORY_CHROME;
   if (configured && existsSync(configured)) return configured;
-  const candidates = [configured, "/usr/bin/chromium", "/usr/bin/google-chrome", "/usr/bin/chromium-browser"];
+  const candidates = [configured, "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
   try {
     for (const version of readdirSync(join(homedir(), ".cache", "ms-playwright"))) candidates.push(join(homedir(), ".cache", "ms-playwright", version, "chrome-linux64", "chrome"));
   } catch { /* The browser cache is optional. */ }
