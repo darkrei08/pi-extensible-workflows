@@ -180,3 +180,35 @@ void test("terminal claim and detach race has exactly one winner", async () => {
     assert.equal(delivered.length, detachFirst ? 1 : 0);
   }
 });
+
+void test("deliveriesSettled waits for every tracked delivery, also one tracked while it waits", async () => {
+  const { store } = storeFor("tracked");
+  const controller = controllerFor(store, []);
+  let releaseFirst!: () => void;
+  let releaseSecond!: () => void;
+  controller.trackDelivery(new Promise<void>((resolve) => { releaseFirst = resolve; }));
+  let settled = false;
+  const waiting = controller.deliveriesSettled().then(() => { settled = true; });
+  await waitForTurn();
+  assert.equal(settled, false, "a pending delivery holds it");
+  controller.trackDelivery(new Promise<void>((resolve) => { releaseSecond = resolve; }));
+  releaseFirst();
+  await waitForTurn();
+  assert.equal(settled, false, "a delivery tracked while waiting holds it too");
+  releaseSecond();
+  await waiting;
+  assert.equal(settled, true);
+  await controller.deliveriesSettled();
+});
+
+void test("a tracked delivery that fails is reported as a warning, never as an unhandled rejection", async () => {
+  const { store } = storeFor("failing");
+  const warnings: string[] = [];
+  const controller = new ForegroundDeliveryController({ runs: new Map([[store.runId, { store }]]), warn: (content: string) => { warnings.push(content); } });
+  controller.trackDelivery(Promise.reject(new Error("disk gone")));
+  await controller.deliveriesSettled();
+  assert.deepEqual(warnings, ["Workflow result delivery failed: disk gone"]);
+  const silent = new ForegroundDeliveryController({ runs: new Map(), warn: () => { throw new Error("ui closed"); } });
+  silent.trackDelivery(Promise.reject(new Error("again")));
+  await silent.deliveriesSettled();
+});

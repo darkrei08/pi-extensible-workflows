@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync, existsSync, readFileSync, symlinkSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, renameSync, rmSync, utimesSync, writeFileSync, existsSync, readFileSync, symlinkSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test from "node:test";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, type RunState } from "pi-extensible-workflows";
 import { acquireSessionLease, RunStore, structuralPath } from "pi-extensible-workflows/persistence";
@@ -31,6 +32,13 @@ async function makeRun(paths: { home: string; cwd: string }, runId: string, stat
   const old = now - 100 * DAY_MS;
   utimesSync(join(store.directory, "state.json"), old / 1000, old / 1000);
   return store;
+}
+
+// Saves evidence and drains the store's best-effort summary refresh so scans never observe its temporary file.
+async function saveEvidence(store: RunStore, text: string): ReturnType<RunStore["saveEvidence"]> {
+  const record = await store.saveEvidence(text);
+  await store.loadSummary();
+  return record;
 }
 
 void test("piewf doctor cleanup --yes deletes a clean inventory and formats its report", async () => {
@@ -252,6 +260,65 @@ void test("doctor cleanup fails closed for missing or corrupt persisted artifact
     assert.equal(existsSync(corrupt.directory), true, mutation.file);
     assert.equal(existsSync(sibling.directory), true, mutation.file);
   }
+});
+void test("doctor cleanup hashes exact evidence bytes", async () => {
+  const now = 1_000_000_000_000;
+  const paths = fixture();
+  const valid = await makeRun(paths, "valid-evidence", "completed", now);
+  const record = await saveEvidence(valid, "Unicode \u2603 evidence");
+  assert.equal(record.bytes, readFileSync(record.path).length);
+  const cleaned = await doctorCleanup({ ...paths, olderThanDays: 90, yes: true, now });
+  assert.deepEqual(cleaned.failures, []);
+  assert.equal(cleaned.deleted.length, 1);
+  assert.equal(existsSync(valid.directory), false);
+
+  const invalidPaths = fixture();
+  const invalid = await makeRun(invalidPaths, "invalid-evidence", "completed", now);
+  const sibling = await makeRun(invalidPaths, "sibling", "completed", now);
+  const replacement = await saveEvidence(invalid, "\uFFFD");
+  assert.deepEqual([...readFileSync(replacement.path)], [0xef, 0xbf, 0xbd]);
+  writeFileSync(replacement.path, Buffer.from([0xff]));
+  const report = await doctorCleanup({ ...invalidPaths, olderThanDays: 90, yes: true, now });
+  assert.equal(report.failures.length, 1);
+  assert.match(report.failures[0]?.message ?? "", /Evidence artifact content does not match checksum/);
+  assert.deepEqual(report.deleted, []);
+  assert.equal(existsSync(invalid.directory), true);
+  assert.equal(existsSync(sibling.directory), true);
+});
+// Counts evidence payload reads through the real fs binding that RunStore imports; `onRead` runs before each read.
+async function withEvidenceReads<T>(onRead: () => void, action: () => Promise<T>): Promise<{ value: T; reads: number }> {
+  const original = fs.promises.readFile;
+  let reads = 0;
+  fs.promises.readFile = ((...args: Parameters<typeof original>) => { onRead(); if (typeof args[0] === "string" && args[0].includes(`${sep}evidence${sep}`)) reads += 1; return original(...args); }) as typeof original;
+  syncBuiltinESMExports();
+  try { return { value: await action(), reads }; } finally { fs.promises.readFile = original; syncBuiltinESMExports(); }
+}
+void test("doctor cleanup hashes each unchanged evidence artifact once and rehashes changed ones", async () => {
+  const now = 1_000_000_000_000;
+  const paths = fixture();
+  const runs = await Promise.all(["run-a", "run-b", "run-c", "run-d"].map(async (runId) => { const store = await makeRun(paths, runId, "failed", now); return { store, record: await saveEvidence(store, `${runId} log`) }; }));
+  const cleaned = await withEvidenceReads(() => {}, () => doctorCleanup({ ...paths, olderThanDays: 90, yes: true, now }));
+  assert.deepEqual(cleaned.value.failures, []);
+  assert.equal(cleaned.value.deleted.length, 4);
+  assert.equal(cleaned.reads, 4, "each evidence artifact is hashed once across all rescans");
+
+  const tamperedPaths = fixture();
+  const tampered = await Promise.all(["run-a", "run-b", "run-c", "run-d"].map(async (runId) => { const store = await makeRun(tamperedPaths, runId, "failed", now); return { store, record: await saveEvidence(store, `${runId} log`) }; }));
+  let changed = false;
+  // After the first deletion, rewrite a surviving artifact with same-size bytes before the next rescan.
+  const report = await withEvidenceReads(() => {
+    if (changed || tampered.every(({ store }) => existsSync(store.directory))) return;
+    const survivor = tampered.find(({ store }) => existsSync(store.directory));
+    assert.ok(survivor);
+    writeFileSync(survivor.record.path, "x".repeat(survivor.record.bytes));
+    changed = true;
+  }, () => doctorCleanup({ ...tamperedPaths, olderThanDays: 90, yes: true, now }));
+  assert.equal(changed, true);
+  assert.equal(report.value.deleted.length, 1);
+  assert.equal(report.value.failures.length, 1);
+  assert.match(report.value.failures[0]?.message ?? "", /Evidence artifact content does not match checksum/);
+  assert.equal(tampered.filter(({ store }) => existsSync(store.directory)).length, 3);
+  assert.equal(runs.some(({ store }) => existsSync(store.directory)), false);
 });
 void test("doctor cleanup fails closed for unsafe run mutations", async () => {
   const now = 1_000_000_000_000;

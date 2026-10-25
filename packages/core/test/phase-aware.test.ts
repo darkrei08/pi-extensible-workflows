@@ -24,6 +24,7 @@ import {
   type PersistedRun,
 } from "../src/index.js";
 import { RunStore } from "../src/persistence.js";
+import { decodePersistedRun } from "../src/decoders.js";
 
 function agent(id: string, state: AgentRecord["state"] = "completed", parentId?: string): AgentRecord {
   return { id, name: id, path: id, state, ...(parentId ? { parentId } : {}), model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 };
@@ -152,6 +153,40 @@ void test("phase dashboard shows agent accounting breakdown only when measured",
   assert.match(free, /Tokens: ∑3 ↑1 ↓2 ⇢0 ⇠0/);
   assert.match(free, /Cost: \$0\.00/);
 });
+void test("phase and operation details total usage across their agents", () => {
+  const usage = (input: number, output: number, cost: number, startedAt: number, durationMs: number): Partial<AgentRecord> => ({ accounting: { input, output, cacheRead: 0, cacheWrite: 0, cost }, startedAt, durationMs });
+  const agents = [
+    { ...agent("a"), structuralPath: ["fn", "a"], ...usage(100, 10, 0.5, 1000, 2000) },
+    { ...agent("b"), structuralPath: ["fn", "b"], ...usage(200, 20, 0.25, 2000, 4000) },
+  ];
+  const current = run("completed", agents, [{ phase: "review", afterAgent: 0 }]);
+  const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(current, snapshot(["review"])));
+  for (const kind of ["phase", "operation"]) {
+    const node = tree.nodes.find((candidate) => candidate.kind === kind);
+    assert.ok(node, kind);
+    const text = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, { detailsOnly: true, nodeId: node.id }).join("\n");
+    assert.match(text, /Tokens: ∑330 ↑300 ↓30/, kind);
+    assert.match(text, /Cost: \$0\.75/, kind);
+    assert.match(text, /Elapsed: 5s/, kind);
+  }
+});
+void test("phase and operation details include agents nested under agents", () => {
+  const usage = (input: number, cost: number, startedAt: number, durationMs: number): Partial<AgentRecord> => ({ accounting: { input, output: 0, cacheRead: 0, cacheWrite: 0, cost }, startedAt, durationMs });
+  const agents = [
+    { ...agent("p"), structuralPath: ["fn", "p"], ...usage(100, 1, 1000, 2000) },
+    { ...agent("c", "completed", "p"), structuralPath: ["fn", "c"], ...usage(900, 9, 2000, 9000) },
+  ];
+  const current = run("completed", agents, [{ phase: "review", afterAgent: 0 }]);
+  const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(current, snapshot(["review"])));
+  for (const kind of ["phase", "operation"]) {
+    const node = tree.nodes.find((candidate) => candidate.kind === kind);
+    assert.ok(node, kind);
+    const text = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, { detailsOnly: true, nodeId: node.id }).join("\n");
+    assert.match(text, /Tokens: ∑1k/, kind);
+    assert.match(text, /Cost: \$10\.00/, kind);
+    assert.match(text, /Elapsed: 10s/, kind);
+  }
+});
 void test("phase dashboard puts activity first and only shows repeated attempts", () => {
   const selected = { ...agent("worker", "running"), structuralPath: ["work", "worker"], activity: { kind: "text" as const, text: "responding" } };
   const render = (value: AgentRecord): string => formatWorkflowPhaseDashboard(run("running", [value], [{ phase: "review", afterAgent: 0 }]), snapshot(["review"]), 120, { detailsOnly: true, agentId: value.id }).join("\n");
@@ -200,6 +235,13 @@ void test("phase shell activity follows repeated phase occurrences", () => {
   const model = buildWorkflowPhaseModel(current, ["build", "build"]);
   assert.equal(model.phases[0]?.shellActivity, undefined);
   assert.equal(model.phases[1]?.shellActivity?.active, 1);
+});
+void test("a stored run with leftover activeShellsByScope loads without it", () => {
+  const stored = { ...run("running"), activeShellsByPhase: [{ phaseIndex: 0, active: 1, startedAt: 0 }], activeShellsByScope: [{ scope: "build", active: 1, startedAt: 0 }] };
+  const decoded = decodePersistedRun(JSON.parse(JSON.stringify(stored)));
+  assert.ok(decoded);
+  assert.equal(decoded.activeShellsByPhase?.[0]?.active, 1);
+  assert.equal(Object.hasOwn(decoded, "activeShellsByScope"), false);
 });
 void test("phase and agent selections survive read-model polling", () => {
   const before = buildWorkflowPhaseModel(run("running", [agent("one")], [{ phase: "build", afterAgent: 0 }]), ["build", "review"]);
@@ -350,4 +392,20 @@ void test("workflow artifact views use type-appropriate temporary file content",
   assert.deepEqual(workflowResultArtifact("plain result"), { extension: ".md", content: "plain result" });
   assert.deepEqual(workflowResultArtifact({ answer: 42 }), { extension: ".json", content: "{\n  \"answer\": 42\n}\n" });
   for (const value of [null, false, ["a", 1]]) assert.deepEqual(workflowResultArtifact(value), { extension: ".json", content: `${JSON.stringify(value, null, 2)}\n` });
+});
+void test("details column follows the scrolled viewport beside a long tree", () => {
+  const agents = Array.from({ length: 60 }, (_, index) => agent(`agent-${String(index)}`));
+  const current = run("running", agents, [{ phase: "review", afterAgent: 0 }]);
+  const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(current, ["review"]));
+  const expandedNodeIds = tree.nodes.filter((node) => node.kind !== "agent").map((node) => node.id);
+  const selected = tree.nodes.find((node) => node.kind === "agent" && node.agentId === "agent-50");
+  assert.ok(selected);
+  const detailRow = (lines: readonly string[]): number => lines.findIndex((line) => (line.split(" | ")[1] ?? "").trim() !== "");
+  const base = { nodeId: selected.id, expandedNodeIds };
+  const top = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, base);
+  const scrolled = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, { ...base, scrollTop: 40 });
+  assert.ok(detailRow(top) < 40, "details start at the top when the viewport is at the top");
+  assert.ok(detailRow(scrolled) >= 40, `details must start inside the scrolled viewport, got row ${String(detailRow(scrolled))}`);
+  assert.equal(scrolled.length, top.length);
+  assert.ok(scrolled.some((line) => line.startsWith("→")), "the selected tree row is unchanged");
 });

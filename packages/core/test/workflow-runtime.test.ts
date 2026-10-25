@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import { decodeOwnershipRecords } from "../src/decoders.js";
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]),
 };
+const linux = { skip: process.platform === "linux" ? false : "needs /proc" };
 
 void test("persisted opaque role options remain extension-owned JSON", () => {
   const entries = decodeOwnershipRecords([{ id: "owner", label: "owner", state: "completed", options: { label: "owner", cwd: "/repo", tools: [], agentOptions: { role: { name: "reviewer" } } } }]);
@@ -23,7 +24,10 @@ void test("preflight rejects every static boundary before run creation", () => {
   const createRun = (script: string) => { preflight(script, capabilities, [], { name: "test" }); created += 1; };
   const cases: Array<[string, string]> = [
     ["const x = ;", "INVALID_SYNTAX"],
-    [`agent('a',{model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
+    [`agent('a',{model:'openai/:high'})`, "UNKNOWN_MODEL"],
+    // A trailing segment that names no thinking level reads as part of the model id, so a
+    // mistyped level is now rejected as missing metadata rather than as an unknown model.
+    [`agent('a',{model:'openai/gpt:turbo'})`, "INVALID_METADATA"],
     [`agent('a',{outputSchema:[]})`, "INVALID_SCHEMA"],
     [`agent('a',{label:' '})`, "INVALID_METADATA"],
     [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
@@ -375,6 +379,50 @@ void test("permission-sandboxed child cannot read files, reach network, or spawn
   assert.match(result, /blocked:/);
 });
 
+void test("workflow source and args stay out of the worker's command line, which any local user can read", linux, async () => {
+  const marker = `argv-marker-${String(process.pid)}-${String(Date.now())}`;
+  const run = runWorkflow(`await new Promise(() => {});`, { marker });
+  const workerCommandLines = (): string[] => readdirSync("/proc").filter((pid) => /^\d+$/.test(pid)).flatMap((pid) => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const ppid = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1];
+      const commandLine = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+      return ppid === String(process.pid) && commandLine.includes("child.cjs") ? [commandLine] : [];
+    } catch { return []; }
+  });
+  try {
+    let commandLines = workerCommandLines();
+    for (let attempt = 0; commandLines.length === 0 && attempt < 100; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      commandLines = workerCommandLines();
+    }
+    assert.equal(commandLines.length, 1);
+    assert.ok(!commandLines[0]?.includes(marker), "the worker's command line exposes workflow args");
+  } finally {
+    run.cancel();
+    await run.result.catch(() => undefined);
+  }
+});
+
+void test("a worker that fork() cannot start rejects the run result and removes its temporary directory", linux, async () => {
+  // Linux refuses to start a process with an environment string over 128 KiB, and fork() throws E2BIG synchronously.
+  const originalTmpdir = process.env.TMPDIR;
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-unstartable-"));
+  process.env.TMPDIR = root;
+  process.env.PI_EXTENSIBLE_WORKFLOWS_TEST_OVERSIZED = "x".repeat(200_000);
+  try {
+    let execution: ReturnType<typeof runWorkflow> | undefined;
+    assert.doesNotThrow(() => { execution = runWorkflow("return 1;"); });
+    await assert.rejects(execution?.result ?? Promise.resolve(), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && /E2BIG/.test(error.message));
+    assert.deepEqual(readdirSync(root), []);
+  } finally {
+    delete process.env.PI_EXTENSIBLE_WORKFLOWS_TEST_OVERSIZED;
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 void test("workflow workers support a symlinked temporary directory", async () => {
   const tmpdirVariable = process.platform === "win32" ? "TEMP" : "TMPDIR";
   const originalTmpdir = process.env[tmpdirVariable];
@@ -438,6 +486,26 @@ void test("workflow failure aborts in-flight bridge work", async () => {
   await started;
   await assert.rejects(run.result, /boom/);
   await aborted;
+});
+
+void test("work started after an unawaited phase(name) reaches the host after that phase is recorded; a failed phase still rejects phase()", async () => {
+  const events: string[] = [];
+  const bridge = {
+    async phase(name: string) { await new Promise((resolve) => setTimeout(resolve, 30)); if (name === "bad") throw new WorkflowError("CANCELLED", "phase refused"); events.push(`phase ${name}`); },
+    async shell(command: string) { events.push(`shell ${command}`); return { exitCode: 0, stdout: "", stderr: "" }; },
+  };
+  const ordered = runWorkflow(`phase("verify"); await shell("x"); return true;`, null, bridge);
+  assert.equal(await ordered.result, true);
+  assert.deepEqual(events, ["phase verify", "shell x"], "the shell waited for the phase update");
+  events.length = 0;
+  const failed = runWorkflow(`const refused = phase("bad").then(() => "recorded", () => "refused"); await shell("y"); return await refused;`, null, bridge);
+  assert.equal(await failed.result, "refused", "the phase's own rejection still reaches the script");
+  assert.deepEqual(events, ["shell y"], "work after a failed phase still runs, as before");
+  events.length = 0;
+  const aborted = runWorkflow(`phase("verify"); await Promise.all([shell("z"), Promise.reject(new Error("boom"))]);`, null, bridge);
+  await assert.rejects(aborted.result, /boom/);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(events, ["phase verify"], "a call waiting for the phase when the run failed starts no work");
 });
 
 void test("worker watchdog terminates a synchronous heartbeat stall after five seconds", { timeout: 7000 }, async () => {
@@ -533,4 +601,59 @@ void test("unawaited agent, shell, and function results refuse serialization and
     await assert.rejects(runWorkflow(script, null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && message.test(error.message), script);
   }
   assert.equal(await runWorkflow(`const [a, s, f] = await Promise.all([agent("a"), shell("true"), helper({})]); return JSON.stringify([a, s.exitCode, f]);`, null, bridge).result, JSON.stringify(["agent-value", 0, "function-value"]));
+});
+
+void test("workflow scripts store evidence artifacts", async () => {
+  const stored = new Map<string, string>();
+  const bridge = {
+    evidence: async (content: string | JsonValue) => {
+      const raw = typeof content === "string" ? content : JSON.stringify(content);
+      const ref = "ref:sha256:1234567890abcdef";
+      stored.set(ref, raw);
+      return { ref, sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", path: "/tmp/evidence.txt", bytes: raw.length };
+    },
+  };
+
+  const script = `
+    const rec = await evidence("large test log payload");
+    return rec;
+  `;
+  const result = await runWorkflow(script, null, bridge).result as { ref: string };
+  assert.equal(result.ref, "ref:sha256:1234567890abcdef");
+  assert.equal(stored.get(result.ref), "large test log payload");
+});
+
+void test("evidence rejects non-JSON input before the bridge and preserves valid JSON", async () => {
+  const calls: unknown[] = [];
+  const bridge = { evidence: async (content: string | JsonValue) => { calls.push(content); return { ref: "ref:sha256:1234567890abcdef", sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", path: "/tmp/evidence.txt", bytes: 1 }; } };
+  const invalid = [
+    "NaN", "Infinity", "-Infinity", "({ number: Infinity, missing: undefined })", "({ missing: undefined })", "[1, undefined]", "[, 1]",
+    "Promise.resolve('important')", "({ nested: [Promise.resolve(1)] })", "({ then() {} })", "({ nested: { then: () => 1 } })",
+    "() => 1", "({ fn() {} })", "10n", "({ big: 10n })", "(() => { const o = {}; o.self = o; return o; })()",
+    "({ toJSON() { return 'changed'; } })", "new (class Custom {})()", "Symbol('x')",
+  ];
+  for (const expression of invalid) {
+    await assert.rejects(runWorkflow(`return await evidence(${expression});`, null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && /evidence/i.test(error.message), expression);
+  }
+  assert.deepEqual(calls, []);
+  const valid = ["'text \u2603'", "null", "true", "1.5", "[1, 'a', null, { b: [false] }]", "({ a: 1, nested: { b: 'c' } })"];
+  for (const expression of valid) await runWorkflow(`return await evidence(${expression});`, null, bridge).result;
+  assert.equal(calls.length, valid.length);
+  assert.deepEqual(calls[4], [1, "a", null, { b: [false] }]);
+  const all = await runWorkflow(`const [a, b] = await Promise.all([evidence("a"), evidence("b")]); return [a.ref, b.ref];`, null, bridge).result;
+  assert.deepEqual(all, ["ref:sha256:1234567890abcdef", "ref:sha256:1234567890abcdef"]);
+});
+
+void test("unawaited evidence results refuse serialization and interpolation with a typed error", async () => {
+  const bridge = {
+    evidence: async () => ({ ref: "ref:sha256:1234567890abcdef", sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", path: "/tmp/evidence.txt", bytes: 10 }),
+  };
+  const cases: readonly [string, RegExp][] = [
+    [`const pending = evidence("a"); return JSON.stringify({ pending });`, /Workflow evidence result is a Promise; await it before serialization/],
+    [`const pending = evidence("a"); return \`\${pending}\`;`, /Workflow evidence result is a Promise; await it before interpolation/],
+    [`const pending = evidence("a"); return "" + pending;`, /Workflow evidence result is a Promise; await it before interpolation/],
+  ];
+  for (const [script, message] of cases) {
+    await assert.rejects(runWorkflow(script, null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && message.test(error.message), script);
+  }
 });

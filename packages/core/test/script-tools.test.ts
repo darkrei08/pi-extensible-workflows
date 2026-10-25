@@ -3,8 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { testExtensionApi } from "./support.js";
-import workflowExtension, { runWorkflow, WorkflowError, RunStore } from "../src/index.js";
+import { callUnchecked, testExtensionApi } from "./support.js";
+import workflowExtension, { defineWorkflowFunction, registerWorkflowExtension, resetWorkflowRegistry, runWorkflow, WorkflowError, WorkflowRegistry, RunStore } from "../src/index.js";
+import { Type } from "typebox";
+import { withWorkflowFunctions, workflowRunContext } from "../src/host-runtime.js";
 import { toolIdentityPath } from "../src/execution.js";
 import { formatWorkflowProgress } from "../src/host-view.js";
 import { listRunIds } from "../src/persistence.js";
@@ -40,6 +42,124 @@ void test("workflow scripts call tools keyed by scope and arguments, and stay ou
   assert.equal(toolIdentityPath("read", { a: 1, b: { c: 2, d: 3 } }, identity), toolIdentityPath("read", { b: { d: 3, c: 2 }, a: 1 }, identity), "key order does not change the journal path");
   assert.notEqual(toolIdentityPath("read", { path: "a" }, identity), toolIdentityPath("read", { path: "b" }, identity));
   await assert.rejects(runWorkflow("return await tools.read({});").result, (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+});
+
+void test("registered function tools share argument, probing, worktree, and structural scope rules", async () => {
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Function tools", functions: {
+    readTool: defineWorkflowFunction({ description: "Read", input: Type.Object({}), output: Type.String(), async run(_input, context) {
+      const { read } = context.tools;
+      assert.ok(read);
+      const result = await read({ path: "a" });
+      assert.ok(typeof result === "string");
+      return result;
+    } }),
+    checks: defineWorkflowFunction({ description: "Check tool scopes", input: Type.Object({}), output: Type.Object({}), async run(_input, context) {
+      const { read } = context.tools;
+      assert.ok(read);
+      for (const args of [[null], [[]], ["a"], [{}, {}]]) {
+        assert.throws(() => callUnchecked(read, undefined, args), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && error.message === "tools.read takes one arguments object");
+      }
+      assert.throws(() => "read" in context.tools, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+      assert.equal(context.tools.then, undefined);
+      assert.equal(context.tools.toJSON, undefined);
+      const blocked = (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && error.message === "tools.read is unavailable inside withWorktree: session tools resolve paths against the session working directory";
+      await assert.rejects(context.withWorktree("tree", () => read({})), blocked);
+      await assert.rejects(context.withWorktree("tree", () => context.invoke("readTool", {})), blocked);
+      await read({ path: "a" });
+      await read({ path: "a" });
+      await context.parallel("fan", { left: () => read({ path: "a" }), right: () => read({ path: "a" }) });
+      await context.pipeline("items", { one: "a" }, { read: (path) => read({ path }) });
+      await context.invoke("readTool", {});
+      await context.invoke("readTool", {});
+      return {};
+    } }),
+  } });
+  const paths: string[] = [];
+  const store = { replay: async () => undefined, complete: async () => {} } as unknown as RunStore;
+  const controller = new AbortController();
+  const run = workflowRunContext("/repo", "session", "run", { name: "tools" }, null, controller.signal);
+  const bridge = withWorkflowFunctions({
+    tool: async (name, args, _signal, identity) => { paths.push(toolIdentityPath(name, args, identity)); return "read"; },
+    worktree: async () => ({ path: "/tmp/tree", branch: "tree" }),
+  }, store, run, registry);
+  await runWorkflow('await tools.read({ path: "a" }); await checks({}); return checks({});', null, bridge).result;
+  assert.equal(paths.length, 15);
+  assert.equal(new Set(paths).size, paths.length, "script, repeated function, nested invoke, branch, stage, and occurrence identities stay distinct");
+  await assert.rejects(runWorkflow('return withWorktree("tree", () => readTool({}));', null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && error.message.includes("unavailable inside withWorktree"));
+  const noTools = withWorkflowFunctions({}, store, run, registry);
+  await assert.rejects(runWorkflow("return readTool({});", null, noTools).result, (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+});
+
+void test("registered functions use the session tool bridge and replay partial calls on retry and resume", async (t) => {
+  for (const recovery of ["retry", "resume"] as const) await t.test(recovery, async (t) => {
+    const home = mkdtempSync(join(tmpdir(), "pi-function-tools-"));
+    resetWorkflowRegistry();
+    t.after(() => { resetWorkflowRegistry(); rmSync(home, { recursive: true, force: true }); });
+    const registered: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ structuredContent?: unknown }> }> = [];
+    workflowExtension(testExtensionApi({ registerTool: (definition) => { registered.push(definition as (typeof registered)[number]); }, getActiveTools: () => ["workflow"] }), home);
+    const execute = (name: string) => { const found = registered.find((entry) => entry.name === name); assert.ok(found); return found.execute; };
+    let functionCalls = 0;
+    registerWorkflowExtension({ version: "1.0.0", headline: "Session tool functions", functions: {
+      leaf: defineWorkflowFunction({ description: "Call text and structured tools", input: Type.Object({}), output: Type.Object({ file: Type.String(), data: Type.Unknown() }), async run(_input, context) {
+        functionCalls += 1;
+        const { read, retail_find } = context.tools;
+        assert.ok(read && retail_find);
+        const file = await read({ path: "a" });
+        assert.ok(typeof file === "string");
+        const data = await retail_find({ query: "a" });
+        return { file, data };
+      } }),
+      outer: defineWorkflowFunction({ description: "Compose tools", input: Type.Object({}), output: Type.Object({ own: Type.String(), nested: Type.Unknown() }), async run(_input, context) {
+        functionCalls += 1;
+        const { read } = context.tools;
+        assert.ok(read);
+        const args = { path: "a" };
+        const pending = read(args);
+        args.path = "changed after the call";
+        const own = await pending;
+        assert.ok(typeof own === "string");
+        return { own, nested: await context.invoke("leaf", {}) };
+      } }),
+      unknown: defineWorkflowFunction({ description: "Unknown tool", input: Type.Object({}), output: Type.Object({}), async run(_input, context) {
+        const { missing } = context.tools;
+        assert.ok(missing);
+        await missing({});
+        return {};
+      } }),
+    } });
+    let fails = true;
+    const executed: string[] = [];
+    const ctx = {
+      cwd: home, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" },
+      tools: [tool("read"), tool("retail-find", bashSchema)],
+      executeTool: async (name: string, args: Record<string, JsonValue>) => {
+        executed.push(name);
+        if (name === "read") {
+          assert.equal(args.path, "a", "arguments are snapshotted at call time, as in the script RPC");
+          return outcome(`text:${String(executed.length)}`);
+        }
+        if (fails && recovery === "resume") throw new WorkflowError("BUDGET_EXHAUSTED", "pause after journaled reads");
+        return fails ? outcome("blocked", { isError: true }) : outcome("structured", { structuredContent: { output: "found", exit_code: 0 }, isError: true });
+      },
+    };
+    const script = 'const inline = await tools.read({ path: "a" }); return { inline, result: await outer({}) };';
+    await assert.rejects(execute("workflow")("first", { name: "function-tools", script, foreground: true }, new AbortController().signal, undefined, ctx), (error: unknown) => error instanceof WorkflowError && error.code === (recovery === "retry" ? "TOOL_FAILED" : "BUDGET_EXHAUSTED"));
+    const [runId] = await listRunIds(home, "session", home, false);
+    assert.ok(runId);
+    const store = new RunStore(home, "session", runId, home);
+    assert.equal((await store.load()).run.state, recovery === "retry" ? "failed" : "budget_exhausted");
+    assert.equal(await store.replay("function/outer/1"), undefined, "the function is incomplete, so recovery must replay individual tool results");
+    assert.deepEqual(executed, ["read", "read", "read", "retail-find"]);
+    fails = false;
+    ctx.tools = [tool("retail-find", bashSchema)];
+    const result = await execute(`workflow_${recovery}`)("recovery", { runId, foreground: true }, new AbortController().signal, undefined, ctx);
+    assert.deepEqual((result.structuredContent as { value: unknown }).value, { inline: "text:1", result: { own: "text:2", nested: { file: "text:3", data: { output: "found", exit_code: 0 } } } });
+    assert.deepEqual(executed, ["read", "read", "read", "retail-find", "retail-find"], "all reads replay even though the recovering session no longer has read");
+    assert.equal(functionCalls, 4, "both incomplete functions run again, not just a completed function replay");
+    await assert.rejects(execute("workflow")("unknown", { name: "unknown-function-tool", script: "return unknown({});", foreground: true }, new AbortController().signal, undefined, ctx), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+    assert.equal((await listRunIds(home, "session", home, false)).length, recovery === "retry" ? 3 : 2, "unknown registered-function tools are checked at call time, after run creation");
+  });
 });
 
 void test("static tool references are known only when the script never rebinds tools", () => {

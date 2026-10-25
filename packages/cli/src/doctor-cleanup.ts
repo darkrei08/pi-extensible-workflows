@@ -9,7 +9,7 @@ import { acquireSessionLease, hasLiveSessionLease, json, projectSessionsDirector
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_RUN_FILES = ["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"] as const;
 const OPTIONAL_RUN_FILES = new Set(["result.json", "summary.json"]);
-const RUN_DIRECTORIES = new Set(["worktrees", ".system-prompts"]);
+const RUN_DIRECTORIES = new Set(["worktrees", ".system-prompts", "evidence"]);
 const RUN_FILES = new Set<string>([...REQUIRED_RUN_FILES, ...OPTIONAL_RUN_FILES]);
 // String-keyed views of the core vocabularies: persisted files are read as unknown, so membership is checked on plain strings.
 const AGENT_STATES = new Set<string>(CORE_AGENT_STATES);
@@ -180,11 +180,12 @@ function validateOwnershipRecord(value: unknown, label: string, ownershipIds: Re
   optionalString(value.prompt, `${label}.prompt`);
   validateScheduledOptions(value.options, `${label}.options`);
 }
-async function validateRunArtifacts(store: RunStore, workflowScript: string, state: RunState): Promise<readonly { sourceRunId: string }[]> {
+async function validateRunArtifacts(store: RunStore, workflowScript: string, state: RunState, verifiedEvidence: Map<string, string>): Promise<readonly { sourceRunId: string }[]> {
   await validateRunDirectory(store);
   for (const name of REQUIRED_RUN_FILES) await requiredFile(join(store.directory, name));
   if (await readFile(join(store.directory, "workflow.js"), "utf8") !== workflowScript) throw new Error("Persisted workflow source does not match its launch snapshot");
   await validateSystemPrompts(store);
+  await store.validateEvidence(verifiedEvidence);
   const result = await json(join(store.directory, "result.json")).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
   if (result === undefined && state === "completed") throw new Error("Completed run result is missing");
   if (result !== undefined && !jsonValue(result)) throw new Error("Persisted workflow result is invalid");
@@ -211,7 +212,7 @@ async function sessionEntries(path: string): Promise<readonly import("node:fs").
   return readdir(path, { withFileTypes: true });
 }
 
-async function scanSession(cwd: string, sessionId: string, home: string, expectedLease?: SessionLease): Promise<SessionScan> {
+async function scanSession(cwd: string, sessionId: string, home: string, verifiedEvidence: Map<string, string>, expectedLease?: SessionLease): Promise<SessionScan> {
   const path = join(projectSessionsDirectory(cwd, home), sessionId);
   const rootEntries = await sessionEntries(path);
   const runsEntry = rootEntries.find((entry) => entry.name === "runs");
@@ -239,7 +240,7 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
       validateSnapshot(loaded.snapshot);
       if (loaded.run.parentRunId !== undefined) await store.validateParentRun(loaded.run.parentRunId);
       if (loaded.run.retry) await store.validateRetrySource();
-      const borrowed = await validateRunArtifacts(store, loaded.snapshot.script, loaded.run.state);
+      const borrowed = await validateRunArtifacts(store, loaded.snapshot.script, loaded.run.state, verifiedEvidence);
       const afterState = await stat(join(store.directory, "state.json"));
       if (beforeState.mtimeMs !== afterState.mtimeMs) throw new Error("Persisted state changed while scanning");
       const dependencies = new Set<string>();
@@ -340,8 +341,10 @@ export async function doctorCleanup(options: DoctorCleanupOptions = {}): Promise
   let sessionIds: readonly string[];
   try { sessionIds = await storedSessionIds(cwd, home); } catch (error) { addFailure(failures, "(project)", errorText(error)); return { cwd, cutoffMs, olderThanDays, yes, sessions, candidates, skipped, deleted, failures }; }
   for (const sessionId of sessionIds) {
+    // Rescans before each deletion hash only evidence that is new or changed since this session was first scanned.
+    const verifiedEvidence = new Map<string, string>();
     let initial: SessionScan;
-    try { initial = await scanSession(cwd, sessionId, home); } catch (error) { sessions.push({ sessionId, path: join(projectSessionsDirectory(cwd, home), sessionId), status: "failed", reason: errorText(error) }); addFailure(failures, sessionId, errorText(error)); continue; }
+    try { initial = await scanSession(cwd, sessionId, home, verifiedEvidence); } catch (error) { sessions.push({ sessionId, path: join(projectSessionsDirectory(cwd, home), sessionId), status: "failed", reason: errorText(error) }); addFailure(failures, sessionId, errorText(error)); continue; }
     const initialPlan = planSession(initial, cutoffMs);
     for (const item of initialPlan.candidates) addUnique(candidates, runItem(item, "candidate"));
     for (const item of initialPlan.skipped) addUnique(skipped, item);
@@ -354,14 +357,14 @@ export async function doctorCleanup(options: DoctorCleanupOptions = {}): Promise
     }
     try {
       let current: SessionScan;
-      try { current = await scanSession(cwd, sessionId, home, lease); } catch (error) { const message = errorText(error); sessions.push({ sessionId, path: initial.path, status: "failed", reason: message }); addFailure(failures, sessionId, message); continue; }
+      try { current = await scanSession(cwd, sessionId, home, verifiedEvidence, lease); } catch (error) { const message = errorText(error); sessions.push({ sessionId, path: initial.path, status: "failed", reason: message }); addFailure(failures, sessionId, message); continue; }
       let freshPlan = planSession(current, cutoffMs);
       for (const item of freshPlan.candidates) addUnique(candidates, runItem(item, "candidate"));
       const freshIds = new Set(freshPlan.candidates.map(({ runId }) => runId));
       for (const item of initialPlan.candidates) if (!freshIds.has(item.runId)) addUnique(skipped, runItem(item, "skipped", "Candidate changed or is no longer independently eligible"));
       let clean = true;
       while (freshPlan.candidates.length) {
-        try { current = await scanSession(cwd, sessionId, home, lease); freshPlan = planSession(current, cutoffMs); for (const item of freshPlan.skipped) addUnique(skipped, item); } catch (error) { const message = errorText(error); addFailure(failures, sessionId, message); clean = false; break; }
+        try { current = await scanSession(cwd, sessionId, home, verifiedEvidence, lease); freshPlan = planSession(current, cutoffMs); for (const item of freshPlan.skipped) addUnique(skipped, item); } catch (error) { const message = errorText(error); addFailure(failures, sessionId, message); clean = false; break; }
         if (!freshPlan.candidates.length) break;
         let ordered: readonly StoredRun[];
         try { ordered = deletionOrder(current, freshPlan.candidates); } catch (error) { const message = errorText(error); addFailure(failures, sessionId, message); clean = false; break; }

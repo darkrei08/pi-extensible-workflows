@@ -169,10 +169,15 @@ try {
   if (semanticResult.status !== 0) throw new Error(`Installed Semantic Map consumer failed:\n${semanticResult.stderr}`);
   process.stdout.write(semanticResult.stdout);
 
-  const cli = spawnSync(resolve(installRoot, "node_modules", ".bin", "piewf"), ["run", "--help"], { cwd: work, encoding: "utf8" });
+  const cliPath = resolve(installRoot, "node_modules", ".bin", "piewf");
+  const cli = spawnSync(cliPath, ["run", "--help"], { cwd: work, encoding: "utf8" });
   const cliOutput = `${cli.stdout ?? ""}${cli.stderr ?? ""}`;
   if (cli.error) throw cli.error;
   if (cli.status !== 0 || !cliOutput.includes("Usage: piewf run")) throw new Error(`Standalone CLI smoke test failed (${String(cli.status)}):\n${cliOutput}`);
+  const cliVersion = spawnSync(cliPath, ["--version"], { cwd: work, encoding: "utf8" });
+  if (cliVersion.error) throw cliVersion.error;
+  const expectedCliVersion = packages.find(({ manifest }) => manifest.name === "@piewf/cli")?.manifest.version;
+  if (cliVersion.status !== 0 || cliVersion.stdout !== `${expectedCliVersion}\n` || cliVersion.stderr !== "") throw new Error(`Standalone CLI version smoke test failed (${String(cliVersion.status)}):\n${cliVersion.stdout ?? ""}${cliVersion.stderr ?? ""}`);
   if (existsSync(packagePath(installRoot, "@piewf/pi-ext-roles"))) throw new Error("Workflows installed the optional roles package");
   const smokeEnv = { ...process.env, HOME: work, PI_CODING_AGENT_DIR: resolve(work, "isolated-agent"), PI_OFFLINE: "1" };
   const importSmoke = spawnSync(process.execPath, ["--input-type=module", "-e", `
@@ -195,6 +200,14 @@ try {
   // npm-shrinkwrap.json of @earendil-works/pi-coding-agent@1.0.0, which pins 5.0.9 (fixed in 5.0.12)
   // and cannot be overridden by a dependent. Drop them once Pi ships an updated shrinkwrap.
   const ignoredAdvisories = new Set(["https://github.com/advisories/GHSA-q2hr-2g5m-vwhr", "https://github.com/advisories/GHSA-qhr7-859c-m2p7", "https://github.com/advisories/GHSA-6j4f-fj2g-mc7p"]);
+  // Release 6.3.0 explicitly defers Pi's undici 8.10.2 advisories (#354). This is not a fix;
+  // the exception expires with the next version, and every other advisory still blocks publication.
+  if (json(resolve(root, "package.json")).version === "6.3.0") {
+    for (const id of ["GHSA-4qv8-2p9j-2685", "GHSA-f72v-6w45-q472", "GHSA-xjj6-f33q-929c"]) {
+      ignoredAdvisories.add(`https://github.com/advisories/${id}`);
+    }
+    process.stderr.write("WARNING: release 6.3.0 accepts three known undici advisories (two moderate, one high); #354 remains open.\n");
+  }
   const audit = spawnSync("npm", ["audit", "--prefix", installRoot, "--omit=dev", "--json"], { encoding: "utf8", timeout: 60_000 });
   if (audit.error) throw audit.error;
   const report = JSON.parse(audit.stdout);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -113,3 +113,46 @@ void test("runDependencyIds lists the parent, retry lineage, and borrowed worktr
   assert.deepEqual(runDependencyIds({ parentRunId: "parent" }, []), ["parent"]);
   assert.deepEqual(runDependencyIds({ parentRunId: "source", retry: { sourceRunId: "source", lineageRootRunId: "root", completedPaths: [], incompletePaths: [], namedWorktrees: [] } }, [{ name: "shared", sourceRunId: "lender", owner: "worktree/named/shared" }]), ["source", "root", "lender"]);
 });
+
+async function evidenceFixture(): Promise<{ paths: { home: string; cwd: string }; old: RunStore; sibling: RunStore; dir: string }> {
+  const paths = fixture();
+  const old = await makeRun(paths, "old", "failed", NOW - 100 * DAY_MS);
+  const sibling = await makeRun(paths, "sibling", "failed", NOW - 100 * DAY_MS);
+  await old.saveEvidence("legitimate");
+  return { paths, old, sibling, dir: old.evidenceDirectory() };
+}
+const retain = (paths: { home: string; cwd: string }) => retainTerminalRuns({ ...paths, sessionId: "session", retention: { olderThanDays: 30 }, now: NOW });
+
+void test("retention deletes runs with valid evidence and runs without an evidence directory", async () => {
+  const { paths, old, sibling } = await evidenceFixture();
+  assert.equal(existsSync(sibling.evidenceDirectory()), false);
+  assert.deepEqual([...(await retain(paths)).deleted].sort(), ["old", "sibling"]);
+  assert.equal(existsSync(old.directory), false);
+  assert.equal(existsSync(sibling.directory), false);
+});
+
+void test("retention accepts only the exact in-flight summary write beside a run", async () => {
+  const { paths, old, sibling } = await evidenceFixture();
+  writeFileSync(join(old.directory, "summary.json.4242.0b2f6c1e-5d7a-4c3b-9e8f-1a2b3c4d5e6f.tmp"), "{}");
+  writeFileSync(join(sibling.directory, "summary.json.4242.not-a-uuid.tmp"), "{}");
+  await assert.rejects(retain(paths), /unrecognized artifact/);
+  assert.equal(existsSync(old.directory), true);
+  assert.equal(existsSync(sibling.directory), true);
+  rmSync(join(sibling.directory, "summary.json.4242.not-a-uuid.tmp"));
+  assert.deepEqual([...(await retain(paths)).deleted].sort(), ["old", "sibling"]);
+});
+
+for (const [name, tamper, message] of [
+  ["invalid file name", (dir: string) => { writeFileSync(join(dir, "notes.txt"), "user content"); }, /Evidence file name is invalid/],
+  ["symlink", (dir: string) => { symlinkSync("/etc/hostname", join(dir, `${"a".repeat(64)}.txt`)); }, /not a regular file/],
+  ["non-regular entry", (dir: string) => { mkdirSync(join(dir, `${"b".repeat(64)}.txt`)); }, /not a regular file/],
+  ["checksum tampering", (dir: string) => { writeFileSync(join(dir, readdirSync(dir)[0] ?? ""), "tampered"); }, /does not match checksum/],
+] as const) {
+  void test(`retention preserves every candidate when evidence has ${name}`, async () => {
+    const { paths, old, sibling, dir } = await evidenceFixture();
+    tamper(dir);
+    await assert.rejects(retain(paths), message);
+    assert.equal(existsSync(old.directory), true);
+    assert.equal(existsSync(sibling.directory), true);
+  });
+}

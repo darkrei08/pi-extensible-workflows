@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import test from "node:test";
 import { testExtensionApi } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, registerWorkflowExtension, RunStore, runWorkflow, structuralPath, WorkflowError, WorkflowRegistry, type JsonValue, type WorkflowFunctionContext } from "../src/index.js";
 import { loadingRegistry } from "../src/registry.js";
+import { scriptToolValue } from "../src/script-tools.js";
 import { withWorkflowFunctions, workflowRunContext } from "../src/host-runtime.js";
 import type { SessionInput } from "../src/agent-execution.js";
 
@@ -108,7 +109,7 @@ void test("production resume reruns dynamic aliases, replays completed work, and
       inputs.push(input);
       return { sessionId: `resume-${String(inputs.length)}`, sessionFile: `/sessions/resume-${String(inputs.length)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
     };
-    workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, value: { handler: (args: string, ctx: unknown) => Promise<void> }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession), agentDir);
+    workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(name: string, value: { handler: (args: string, ctx: unknown) => Promise<void> }) { if (name === "workflow") command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession), agentDir);
     registerWorkflowExtension({ version: "1.0.0", headline: "Resume policy", modelAliases: { "dynamic-model": { resolve: () => { resolverCalls += 1; return "new/model"; } } } });
     const context = { cwd, hasUI: false, model: { provider: "root", id: "model" }, modelRegistry: { getAll: () => [{ provider: "root", id: "model" }, { provider: "old", id: "model" }, { provider: "new", id: "model" }], getAvailable: () => [{ provider: "root", id: "model" }, { provider: "new", id: "model" }] }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
     assert.ok(start && command && shutdown);
@@ -183,7 +184,7 @@ void test("registers global functions and replays each call as one validated ope
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
-  const context = { settings: { acme: { enabled: true } }, run, invoke: async () => null, agent: async () => null, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { settings: { acme: { enabled: true } }, run, tools: {}, invoke: async () => null, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
   assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
   assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
@@ -193,7 +194,7 @@ void test("registers global functions and replays each call as one validated ope
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
   assert.deepEqual((receivedContext as { settings: unknown }).settings, { acme: { enabled: true } });
   assert.ok(Object.isFrozen((receivedContext as { settings: object }).settings));
-  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "settings", "shell", "withWorktree"]);
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "settings", "shell", "tools", "withWorktree"]);
   assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
 });
 void test("registered function context.invoke validates nested calls and replays completed children", async () => {
@@ -211,7 +212,7 @@ void test("registered function context.invoke validates nested calls and replays
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "composition" }), args: null, signal: new AbortController().signal });
   const parentPath = "function/outer/1";
   const occurrences = new Map<string, number>();
-  const context: WorkflowFunctionContext = { settings: {}, run, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: async () => null, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context: WorkflowFunctionContext = { settings: {}, run, tools: {}, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
   assert.equal(leafCalls, 1);
   occurrences.clear();
@@ -493,4 +494,40 @@ assert.equal(catalogActive(), true);
 await runtime.dispose();
 `;
   execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe" });
+});
+void test("a replayed registered function returns the original evidence record, readable with tools.read", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-retry-"));
+  const cwd = join(home, "project");
+  let producerRuns = 0;
+  const registry = new WorkflowRegistry();
+  registry.register({
+    version: "1.0.0", headline: "Evidence producer",
+    functions: {
+      producer: {
+        description: "Saves evidence", input: { type: "object", additionalProperties: false },
+        output: { type: "object", properties: { ref: { type: "string" }, sha256: { type: "string" }, path: { type: "string" }, bytes: { type: "number" } }, required: ["ref", "sha256", "path", "bytes"], additionalProperties: false },
+        async run(_input, context) {
+          producerRuns += 1;
+          if (!context.evidence) throw new Error("Missing evidence capability");
+          return { ...(await context.evidence("full original log")) };
+        },
+      },
+    },
+  });
+  const script = "const record = await producer({}); if (args.fail) throw new Error('retry me'); return await tools.read({ path: record.path });";
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "evidence-retry" }, settings: { concurrency: 1 }, models: ["root/model"], tools: [], agentConfigurations: {}, schemas: [] });
+  const readTool = { name: "read" } as unknown as Parameters<typeof scriptToolValue>[0];
+  const execute = (store: RunStore, runId: string, fail: boolean) => {
+    const controller = new AbortController();
+    const bridge = withWorkflowFunctions({ evidence: async (content) => store.saveEvidence(content), tool: async (identifier, args) => identifier !== "read" ? assert.fail(`unexpected tool ${identifier}`) : scriptToolValue(readTool, { result: { content: [{ type: "text", text: readFileSync(typeof args.path === "string" ? args.path : assert.fail("path must be a string"), "utf8") }] }, isError: false } as unknown as Parameters<typeof scriptToolValue>[1]) }, store, workflowRunContext(cwd, "session", runId, { name: "evidence-retry" }, null, controller.signal), registry);
+    return runWorkflow(script.replace("args.fail", String(fail)), null, bridge).result;
+  };
+  const source = new RunStore(cwd, "session", "run-a", home);
+  await source.create({ id: "run-a", workflowName: "evidence-retry", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
+  await assert.rejects(execute(source, "run-a", true), /retry me/);
+  assert.equal(producerRuns, 1);
+  const child = new RunStore(cwd, "session", "run-b", home);
+  await child.create({ id: "run-b", workflowName: "evidence-retry", cwd, sessionId: "session", state: "running", parentRunId: "run-a", retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [], incompletePaths: [], namedWorktrees: [] }, agents: [], agentSessions: [] }, snapshot);
+  assert.equal(await execute(child, "run-b", false), "full original log");
+  assert.equal(producerRuns, 1, "the producer must be replayed, not rerun");
 });

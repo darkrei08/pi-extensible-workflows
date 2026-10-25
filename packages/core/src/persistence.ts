@@ -8,5 +8,5 @@ export { decodePreparedAgentConfiguration } from "./decoders.js";
 export {
   EffectiveSystemPrompt, PersistedRun, RunSummaryAgent, RunSummaryArtifacts, RunSummary,
   CompletedOperation, AwaitingCheckpoint, PendingWorkflowDecision, PersistedOwnershipNode,
-  WorktreeReference, BorrowedWorktreeBinding, isPersistedRun,
+  WorktreeReference, BorrowedWorktreeBinding, isPersistedRun, EvidenceRecord,
 } from "./decoders.js";

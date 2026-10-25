@@ -2,10 +2,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { type AgentProviderFailure, type AgentProviderRecovery, WorkflowAgentExecutor } from "./agent-execution.js";
 import { type WorkflowBudgetRuntime } from "./budget.js";
 import { type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
-import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
+import { createWorkflowTools, encoded, FUNCTION_HANDLE_PREFIX } from "./execution.js";
+import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonDigest, jsonValue, object } from "./utils.js";
 import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
 import { type WorkflowRegistryApi } from "./registry.js";
-import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentOptions, type AgentRecord, type BudgetEvent, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentHandle, type AgentOptions, type AgentRecord, type BudgetEvent, type EvidenceRecord, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
 import { structuralPath as operationPath } from "./persistence.js";
 
 export type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -22,7 +23,7 @@ export type WorkflowRunRecord = {
   budget: WorkflowBudgetRuntime;
   abortController: AbortController;
   projectTrusted: () => boolean;
-  providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>;
+  providerErrorRecovery?: (failure: AgentProviderFailure, signal: AbortSignal) => Promise<AgentProviderRecovery>;
   execution?: WorkflowExecution;
   completion?: Promise<unknown>;
   foreground?: boolean;
@@ -278,6 +279,18 @@ async function hostPipeline<Items extends PipelineItems, Output extends JsonValu
   return Object.fromEntries(results.flatMap((result) => "value" in result ? [[result.name, result.value] as const] : [])) as PipelineResult<Items, Output>;
 }
 
+/** Evidence writes follow the run lifecycle like every other host operation: they wait while paused and never start once cancelled. */
+export function evidenceBridge(store: RunStore, lifecycle: RunLifecycle): (content: string | JsonValue, signal: AbortSignal) => Promise<EvidenceRecord> {
+  const assertActive = (signal: AbortSignal): void => { if (signal.aborted) throw new WorkflowError("CANCELLED", "Workflow cancelled"); };
+  return async (content, signal) => {
+    assertActive(signal);
+    await lifecycle.enter();
+    try {
+      assertActive(signal);
+      return await store.saveEvidence(content);
+    } finally { await lifecycle.leave(); }
+  };
+}
 export function nextNamedOccurrence(counters: Map<string, number>, label: string): string {
   const count = (counters.get(label) ?? 0) + 1;
   counters.set(label, count);
@@ -288,6 +301,7 @@ function functionBreadcrumb(name: string, occurrence: number): string { return o
 
 export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, registry: WorkflowRegistryApi, settings: Readonly<WorkflowExtensionSettings> = Object.freeze({})): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
+  const functionHandles = new Set<string>();
   const functionShellOccurrences = new Map<string, number>();
   const functionInvokeOccurrences = new Map<string, number>();
   const functionInvokeBreadcrumbOccurrences = new Map<string, number>();
@@ -309,10 +323,21 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
       // Own rejection immediately; Promise.all below still propagates it after the function completes.
       void sideEffect.catch(() => undefined);
     };
+    let closed = false;
     const parentBreadcrumb = breadcrumb ?? functionBreadcrumb(name, identity.occurrence);
     const context: WorkflowFunctionContext = {
       settings: deepFreeze(structuredClone(settings)),
       run: runContext,
+      tools: createWorkflowTools({
+        structuralPath: () => ["function", path, ...(inheritedHostAgentPath.getStore() ?? structuralPath)],
+        worktreeOwner: () => inheritedHostWorktreeOwner.getStore() ?? worktreeOwner,
+        call: async (identifier, args, identity) => {
+          if (!bridge.tool) fail("UNKNOWN_TOOL", `tools.${identifier} is unavailable: this run has no session tools`);
+          const toolArgs = JSON.parse(encoded(args)) as Record<string, JsonValue>;
+          return bridge.tool(identifier, toolArgs, signal, identity);
+        },
+        invalid: (message) => new WorkflowError("INVALID_METADATA", message),
+      }),
       invoke: async (targetName, targetInput, label) => {
         if (label !== undefined && (typeof label !== "string" || !label.trim())) fail("INVALID_METADATA", "invoke label must be a non-empty string");
         const inherited = inheritedHostAgentPath.getStore() ?? structuralPath;
@@ -328,7 +353,7 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
         const nestedIdentity: FunctionIdentity = { path: nestedPath, structuralPath: [...inherited], occurrence, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) };
         return invokeFunction(targetName, targetInput, signal, nestedIdentity, `${parentBreadcrumb} > ${functionBreadcrumb(breadcrumbName, breadcrumbOccurrence)}`);
       },
-      agent: async (prompt: string, options?: Readonly<AgentOptions>) => {
+      agent: Object.assign(async (prompt: string, options?: Readonly<AgentOptions>) => {
         if (!bridge.agent || typeof prompt !== "string") fail("AGENT_FAILED", "No agent bridge is available");
         const validatedOptions = validateAgentOptions(options === undefined ? {} : options);
         const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
@@ -337,7 +362,42 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
         const occurrence = (functionAgentOccurrences.get(key) ?? 0) + 1;
         functionAgentOccurrences.set(key, occurrence);
         return bridge.agent(prompt, validatedOptions, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
-      },
+      }, {
+        create: (...created: readonly unknown[]): AgentHandle => {
+          if (created.length !== 1 || !object(created[0])) fail("INVALID_METADATA", "agent.create requires one options object");
+          const { name, ...rest } = created[0];
+          if (typeof name !== "string" || !name.trim()) fail("INVALID_METADATA", "agent.create requires a stable explicit name");
+          const config = deepFreeze(structuredClone(validateAgentOptions(rest)));
+          const scopedStructuralPath = [...(inheritedHostAgentPath.getStore() ?? [])];
+          const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
+          const scope = JSON.stringify([scopedStructuralPath, scopedWorktreeOwner ?? null]);
+          // The registered-function path makes repeated and nested invocations distinct; scope separates branches and worktrees. The digest bounds the journal and turn-copy file names.
+          const handle = operationPath(FUNCTION_HANDLE_PREFIX, jsonDigest([path, scopedStructuralPath, scopedWorktreeOwner ?? null]), name);
+          if (functionHandles.has(handle)) fail("INVALID_METADATA", `Duplicate agent handle name: ${name}`);
+          functionHandles.add(handle);
+          let turn = 0;
+          let inflight = false;
+          // Not a nested promise chain: the caller owns the one returned promise, and inflight clears in finally on every outcome.
+          const send = async (...sent: readonly unknown[]): Promise<JsonValue> => {
+            if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
+            if (sent.length < 1 || sent.length > 2) fail("INVALID_METADATA", "send requires a prompt and optional options");
+            if (closed) fail("INVALID_METADATA", `Agent handle outlived the function invocation that created it: ${name}`);
+            if (typeof sent[0] !== "string") fail("INVALID_METADATA", "send prompt must be a string");
+            const sendOptions = sent[1] === undefined ? {} : sent[1];
+            if (!object(sendOptions) || Object.keys(sendOptions).some((key) => key !== "outputSchema" && key !== "timeoutMs")) fail("INVALID_METADATA", "send options must contain only outputSchema and timeoutMs");
+            const sendStructuralPath = [...(inheritedHostAgentPath.getStore() ?? [])];
+            if (JSON.stringify([sendStructuralPath, inheritedHostWorktreeOwner.getStore() ?? worktreeOwner ?? null]) !== scope) fail("INVALID_METADATA", `Agent handle sends must run in the scope that created the handle: ${name}`);
+            if (inflight) fail("INVALID_METADATA", "Concurrent send(...) calls on one agent handle are unsupported; await each turn");
+            const validatedOptions = validateAgentOptions({ ...config, ...sendOptions });
+            inflight = true;
+            turn += 1;
+            try {
+              return await bridge.agent(sent[0], validatedOptions, signal, { structuralPath: sendStructuralPath, callSite: `function:${path}:handle:${name}`, occurrence: turn, handle, turn, parentBreadcrumb, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
+            } finally { inflight = false; }
+          };
+          return Object.freeze({ name, send }) as AgentHandle;
+        },
+      }),
       shell: async (...args: readonly unknown[]) => {
         if (!bridge.shell) fail("SHELL_FAILED", "No shell bridge is available");
         if (typeof args[0] !== "string") fail("INVALID_METADATA", "shell command must be a string");
@@ -359,8 +419,13 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
       },
       phase: (name: string) => { ownSideEffect(() => bridge.phase?.(name)); },
       log: (message: string) => { ownSideEffect(() => bridge.log?.(message)); },
+      evidence: async (content) => {
+        if (!bridge.evidence) fail("INTERNAL_ERROR", "No evidence bridge is available");
+        if (!jsonValue(content)) fail("INVALID_METADATA", "evidence requires a JSON-compatible value");
+        return bridge.evidence(content, signal);
+      },
     };
-    const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
+    const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } })).finally(() => { closed = true; });
     await Promise.all(sideEffects);
     if (!replayed) await store.complete(path, stored ?? result);
     return result;

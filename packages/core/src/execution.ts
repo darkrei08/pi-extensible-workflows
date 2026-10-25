@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AgentAttempt } from "./agent-execution.js";
-import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, ToolIdentity, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
+import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, ToolIdentity, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution, WorkflowFunctionContext } from "./types.js";
 import { WorkflowError, sumAccounting, zeroAccounting } from "./types.js";
 import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCode, jsonDigest, jsonValue, markWorkflowAuthored, object, positiveInteger } from "./utils.js";
 import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions } from "./validation.js";
@@ -41,14 +41,51 @@ function isRpcMessage(value: unknown): value is RpcMessage {
 const HEARTBEAT_INTERVAL_MS = 1000;
 
 const OUTCOME_ERRORS = new Set<string>(["AGENT_TIMEOUT", "AGENT_FAILED", "RESULT_INVALID"]);
+/** Script handle names may not start with this: registered-function handles are journaled under it. */
+export const FUNCTION_HANDLE_PREFIX = "function-handle";
 const WORK_RESULT_BRAND = "__workResult";
+
+// Keep this factory self-contained: the worker embeds the same implementation used by registered functions.
+export function createWorkflowTools(scope: {
+  structuralPath: () => readonly string[];
+  worktreeOwner: () => string | undefined;
+  call: (identifier: string, args: Record<string, JsonValue>, identity: ToolIdentity) => Promise<JsonValue>;
+  invalid: (message: string) => Error;
+}): WorkflowFunctionContext["tools"] {
+  const notTools = new Set(["then", "toJSON", "toString", "valueOf", "constructor"]);
+  const sortedJson = (value: unknown): unknown => Array.isArray(value) ? value.map(sortedJson) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortedJson((value as Record<string, unknown>)[key])])) : value;
+  const occurrences = new Map<string, number>();
+  const toolCall = (id: string) => (...values: unknown[]): Promise<JsonValue> => {
+    if (scope.worktreeOwner()) throw scope.invalid("tools." + id + " is unavailable inside withWorktree: session tools resolve paths against the session working directory");
+    if (values.length > 1 || values[0] !== undefined && (!values[0] || typeof values[0] !== "object" || Array.isArray(values[0]))) throw scope.invalid("tools." + id + " takes one arguments object");
+    const args = (values[0] === undefined ? {} : values[0]) as Record<string, JsonValue>;
+    const structuralPath = scope.structuralPath();
+    const key = JSON.stringify([structuralPath, id, sortedJson(args)]);
+    const occurrence = (occurrences.get(key) ?? 0) + 1;
+    occurrences.set(key, occurrence);
+    const result = scope.call(id, args, { structuralPath: [...structuralPath], occurrence });
+    const forgottenAwait = (use: string) => () => { throw scope.invalid("Workflow tool result is a Promise; await it before " + use); };
+    return Object.defineProperties(result, {
+      toJSON: { value: forgottenAwait("serialization") },
+      toString: { value: forgottenAwait("interpolation") },
+      [Symbol.toPrimitive]: { value: forgottenAwait("interpolation") },
+    });
+  };
+  return new Proxy(Object.create(null) as WorkflowFunctionContext["tools"], {
+    get: (_target, key) => typeof key === "string" && !notTools.has(key) ? toolCall(key) : undefined,
+    // Probing would branch on the session that resumed the run, before consulting the journal.
+    has: () => { throw scope.invalid("Workflow scripts cannot probe tools with 'in'; call tools.<name>(...) directly, and the launch checks that the tool exists"); },
+    set: () => false,
+    defineProperty: () => false,
+  });
+}
 
 const childSource = String.raw`
 "use strict";
 const { AsyncLocalStorage } = require("node:async_hooks");
 const vm = require("node:vm");
 const LIMIT = parseInt(process.argv[2], 10);
-const config = JSON.parse(process.argv[3]);
+const config = JSON.parse(require("node:fs").readFileSync(process.argv[3], "utf8"));
 for (const key of ["getBuiltinModule","binding","_linkedBinding","dlopen","kill","abort","exit","reallyExit","_kill","umask","chdir","setuid","setgid","seteuid","setegid","setgroups","initgroups"]) {
   if (key in process) process[key] = undefined;
 }
@@ -158,6 +195,7 @@ const internalAgentCreate = (...values) => {
   if (values.length !== 1 || !values[0] || typeof values[0] !== "object" || Array.isArray(values[0])) throw workError("INVALID_METADATA", "agent.create requires one options object");
   const options = values[0];
   const name = named(options.name, "agent.create");
+  if (name.startsWith("${FUNCTION_HANDLE_PREFIX}/")) throw workError("INVALID_METADATA", "Agent handle names may not start with ${FUNCTION_HANDLE_PREFIX}/");
   if (agentHandleNames.has(name)) throw workError("INVALID_METADATA", "Duplicate agent handle name: " + name);
   agentHandleNames.add(name);
   const config = Object.freeze(Object.fromEntries(Object.entries(options).filter(([key]) => key !== "name")));
@@ -213,30 +251,30 @@ const plainPromptObject = value => {
   const proto = Object.getPrototypeOf(value);
   return proto === null || Object.getPrototypeOf(proto) === null && Object.prototype.hasOwnProperty.call(proto, "constructor") && typeof proto.constructor === "function" && Function.prototype.toString.call(proto.constructor) === Function.prototype.toString.call(Object);
 };
-const promptValue = (value, at, seen) => {
+const promptValue = (value, at, seen, kind = "Prompt value") => {
   if (value === null || typeof value === "string" || typeof value === "boolean") return;
-  if (typeof value === "number") { if (!Number.isFinite(value)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" must be a finite number"); return; }
-  if (typeof value !== "object") throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" cannot be " + typeof value);
-  if (typeof value.then === "function") throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" is a Promise or thenable; await it before calling prompt()");
-  if (!Array.isArray(value) && !plainPromptObject(value)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" must be a plain object");
-  if (seen.has(value)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" contains a cycle");
+  if (typeof value === "number") { if (!Number.isFinite(value)) throw workError("INVALID_METADATA", kind + " \"" + at + "\" must be a finite number"); return; }
+  if (typeof value !== "object") throw workError("INVALID_METADATA", kind + " \"" + at + "\" cannot be " + typeof value);
+  if (typeof value.then === "function") throw workError("INVALID_METADATA", kind + " \"" + at + "\" is a Promise or thenable; await it before " + (kind === "Prompt value" ? "calling prompt()" : "storing evidence"));
+  if (!Array.isArray(value) && !plainPromptObject(value)) throw workError("INVALID_METADATA", kind + " \"" + at + "\" must be a plain object");
+  if (seen.has(value)) throw workError("INVALID_METADATA", kind + " \"" + at + "\" contains a cycle");
   const keys = Reflect.ownKeys(value);
   const symbol = keys.find(key => typeof key === "symbol");
-  if (symbol) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" contains a symbol key");
+  if (symbol) throw workError("INVALID_METADATA", kind + " \"" + at + "\" contains a symbol key");
   seen.add(value);
   if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index += 1) promptProperty(value, String(index), at + "[" + index + "]", seen);
+    for (let index = 0; index < value.length; index += 1) promptProperty(value, String(index), at + "[" + index + "]", seen, kind);
     for (const key of keys) {
       const index = Number(key);
-      if (key !== "length" && !(Number.isInteger(index) && index >= 0 && index < value.length && String(index) === key)) promptProperty(value, key, promptPath(at, key), seen);
+      if (key !== "length" && !(Number.isInteger(index) && index >= 0 && index < value.length && String(index) === key)) promptProperty(value, key, promptPath(at, key), seen, kind);
     }
-  } else for (const key of keys) promptProperty(value, key, promptPath(at, key), seen);
+  } else for (const key of keys) promptProperty(value, key, promptPath(at, key), seen, kind);
   seen.delete(value);
 };
-const promptProperty = (value, key, at, seen) => {
+const promptProperty = (value, key, at, seen, kind = "Prompt value") => {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  if (descriptor && (descriptor.get || descriptor.set)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" cannot use getters or setters");
-  promptValue(descriptor && descriptor.value, at, seen);
+  if (descriptor && (descriptor.get || descriptor.set)) throw workError("INVALID_METADATA", kind + " \"" + at + "\" cannot use getters or setters");
+  promptValue(descriptor && descriptor.value, at, seen, kind);
 };
 const prompt = (template, values) => {
   if (typeof template !== "string") throw workError("INVALID_METADATA", "prompt() template must be a string");
@@ -276,25 +314,11 @@ const functions = Object.freeze(Object.fromEntries(Object.entries(config.functio
 // replays journaled calls even when the tool is gone; the host rejects identifiers it cannot call.
 // A call is the n-th call with the same arguments in its scope, so replay does not depend on the
 // order in which concurrent calls start.
-const NOT_TOOLS = new Set(["then", "toJSON", "toString", "valueOf", "constructor"]);
-const sortedJson = value => Array.isArray(value) ? value.map(sortedJson) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sortedJson(value[key])])) : value;
-const toolOccurrences = new Map();
-const toolCall = id => (...values) => {
-  if (worktreeOwners.getStore()) throw workError("INVALID_METADATA", "tools." + id + " is unavailable inside withWorktree: session tools resolve paths against the session working directory");
-  if (values.length > 1 || values[0] !== undefined && (!values[0] || typeof values[0] !== "object" || Array.isArray(values[0]))) throw workError("INVALID_METADATA", "tools." + id + " takes one arguments object");
-  const args = values[0] === undefined ? {} : values[0];
-  const structuralPath = inheritedAgentPath.getStore() || [];
-  const key = JSON.stringify([structuralPath, id, sortedJson(args)]);
-  const occurrence = (toolOccurrences.get(key) || 0) + 1;
-  toolOccurrences.set(key, occurrence);
-  return guardedResult(rpc("tool", [id, args, { structuralPath: [...structuralPath], occurrence }]), "tool");
-};
-const tools = new Proxy(Object.create(null), {
-  get: (_target, key) => typeof key === "string" && !NOT_TOOLS.has(key) ? toolCall(key) : undefined,
-  // Probing would branch on the session that resumed the run; the launch already checks named tools.
-  has: () => { throw workError("INVALID_METADATA", "Workflow scripts cannot probe tools with 'in'; call tools.<name>(...) directly, and the launch checks that the tool exists"); },
-  set: () => false,
-  defineProperty: () => false,
+const tools = (${createWorkflowTools.toString()})({
+  structuralPath: () => inheritedAgentPath.getStore() || [],
+  worktreeOwner: () => worktreeOwners.getStore(),
+  call: (id, args, identity) => rpc("tool", [id, args, identity]),
+  invalid: message => workError("INVALID_METADATA", message),
 });
 const recordEntries = (value, kind) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw workError("INVALID_METADATA", kind + " must be a record");
@@ -355,8 +379,14 @@ const pipeline = async (operationName, items, stages) => {
   if (failure) throw Object.assign(workflowError(failure.error), { failedAt: failure.failedAt });
   return Object.fromEntries(results.map(result => [result.name, result.value]));
 };
+const guardedEvidenceResult = result => guardedResult(result, "evidence");
+const evidence = (...values) => {
+  if (values.length !== 1 || values[0] === undefined) throw workError("INVALID_METADATA", "evidence requires one value argument");
+  promptValue(values[0], "evidence", new Set(), "Evidence value");
+  return guardedEvidenceResult(rpc("evidence", [values[0]]));
+};
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, tools, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, tools, evidence, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbox, name, { value: fn, writable: false, configurable: false });
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
@@ -508,30 +538,50 @@ function workflowErrorFromWorker(error: WorkerErrorShape): WorkflowError {
   const typed = markWorkflowAuthored(new WorkflowError(code, error.message), Boolean(error.authored) || error.code === undefined);
   return error.failedAt === undefined ? typed : Object.assign(typed, { failedAt: error.failedAt });
 }
+/** Forks the sandboxed worker in a new directory; a worker that cannot start leaves no directory behind. */
+function startWorker(config: string): { child: ChildProcess; childDir: string } {
+  const childDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-wf-")));
+  try {
+    const childFile = join(childDir, "child.cjs");
+    writeFileSync(childFile, childSource);
+    // NOTE: the config reaches the worker as a file in childDir, the one directory it may read, not as an argument: Windows caps a
+    // command line at 32,767 characters, Linux caps one argument at 128 KiB, and other local users can read a process's arguments.
+    const configFile = join(childDir, "config.json");
+    writeFileSync(configFile, config);
+    const child = fork(childFile, [String(RPC_LIMIT_BYTES), configFile], {
+      execArgv: (() => {
+        const filtered: string[] = [];
+        const skip = new Set(["--input-type", "-e", "--eval", "-p", "--print"]);
+        let skipNext = false;
+        for (const arg of process.execArgv) {
+          if (skipNext) { skipNext = false; continue; }
+          if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
+          filtered.push(arg);
+        }
+        // NOTE: Bun has no --permission model and rejects/ignores these Node flags; the worker keeps only the vm sandbox there.
+        return process.versions.bun ? filtered : [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
+      })(),
+      // NOTE: a Bun-compiled pi binary is process.execPath; BUN_BE_BUN makes it run child.cjs instead of the pi CLI.
+      env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : process.env,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      serialization: "advanced",
+    });
+    return { child, childDir };
+  } catch (error) {
+    rmSync(childDir, { recursive: true, force: true });
+    throw error;
+  }
+}
 export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
   encoded(args);
   const config = JSON.stringify({ script: instrumentWorkflow(script), args: structuredClone(args), functions: bridge.functions ?? {} });
-  const childDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-wf-")));
-  const childFile = join(childDir, "child.cjs");
-  writeFileSync(childFile, childSource);
-  const child: ChildProcess = fork(childFile, [String(RPC_LIMIT_BYTES), config], {
-    execArgv: (() => {
-      const filtered: string[] = [];
-      const skip = new Set(["--input-type", "-e", "--eval", "-p", "--print"]);
-      let skipNext = false;
-      for (const arg of process.execArgv) {
-        if (skipNext) { skipNext = false; continue; }
-        if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
-        filtered.push(arg);
-      }
-      // NOTE: Bun has no --permission model and rejects/ignores these Node flags; the worker keeps only the vm sandbox there.
-      return process.versions.bun ? filtered : [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
-    })(),
-    // NOTE: a Bun-compiled pi binary is process.execPath; BUN_BE_BUN makes it run child.cjs instead of the pi CLI.
-    env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : process.env,
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
-    serialization: "advanced",
-  });
+  let worker: { child: ChildProcess; childDir: string };
+  try { worker = startWorker(config); } catch (error) {
+    // NOTE: the host persists a run as running before it launches it and records a failure only from `result`, so a worker that
+    // cannot start (a missing temporary directory, or fork() refusing an environment string over Linux's 128 KiB) rejects it.
+    return { result: Promise.reject(new WorkflowError("INTERNAL_ERROR", errorText(error))), cancel: () => undefined };
+  }
+  const { child, childDir } = worker;
   const controller = new AbortController();
   let settled = false;
   let rejectResult: (error: WorkflowError) => void = () => undefined;
@@ -571,8 +621,17 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   function finish() { settled = true; clearInterval(watchdog); signal?.removeEventListener("abort", cancel); killChild(); rmSync(childDir, { recursive: true, force: true }); }
   function stop(code: WorkflowErrorCode, message: string) { if (settled) return; controller.abort(); finish(); rejectResult(new WorkflowError(code, message)); }
   function branded(result: Record<string, JsonValue>): JsonValue { return { ...result, [WORK_RESULT_BRAND]: true }; }
+  // A phase update and the work the script starts after it arrive as separate RPCs handled concurrently. While a phase update
+  // is pending, later RPCs wait for it (not for each other), so work started after an unawaited phase(name) is recorded in that
+  // phase; with none pending they are dispatched at once, as before.
+  let phasePending: Promise<void> | undefined;
   async function handleRpc(id: number, method: string, values: JsonValue[]) {
     try {
+      if (method !== "phase" && phasePending) {
+        await phasePending;
+        // The run ended while this call waited: its worker is gone, there is nothing to answer.
+        if (controller.signal.aborted) return;
+      }
       encoded(values);
       let value: JsonValue = null;
       if (method === "agent") {
@@ -634,12 +693,21 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         value = await bridge.worktree(values[0], controller.signal);
       } else if (method === "phase") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
-        await bridge.phase?.(values[0]);
+        const name = values[0];
+        const update = (phasePending ?? Promise.resolve()).then(() => bridge.phase?.(name));
+        const settled = update.then(() => undefined, () => undefined);
+        phasePending = settled;
+        void settled.then(() => { if (phasePending === settled) phasePending = undefined; });
+        await update;
       } else if (method === "log") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "log message must be a string");
         await bridge.log?.(values[0]);
-      }
-      else fail("INTERNAL_ERROR", `Unknown worker RPC method: ${method}`);
+      } else if (method === "evidence") {
+        if (values.length !== 1 || !jsonValue(values[0])) fail("INTERNAL_ERROR", "evidence requires a JSON-compatible value");
+        if (!bridge.evidence) fail("INTERNAL_ERROR", "No evidence bridge is available");
+        const stored = await bridge.evidence(values[0], controller.signal);
+        value = stored as unknown as JsonValue;
+      } else fail("INTERNAL_ERROR", `Unknown worker RPC method: ${method}`);
       encoded(value);
       child.send(encodedRpcResult(id, value));
     } catch (error) {

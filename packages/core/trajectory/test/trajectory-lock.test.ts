@@ -616,7 +616,7 @@ void test("startup mutex recovery never lets two contenders hold it", async () =
   }
 });
 
-void test("startup mutex recovery rereads a holder whose Pi recorded its server and died after being read", { skip: process.platform === "win32" ? "needs SIGSTOP" : false }, async () => {
+void test("startup mutex recovery rereads a holder whose Pi recorded its server and died after being read", { skip: process.platform === "linux" ? false : "needs /proc" }, async () => {
   const home = await mkdtemp(join(tmpdir(), "trajectory-lock-mutex-record-"));
   const pids: number[] = [];
   try {
@@ -814,7 +814,7 @@ void test("a startup mutex holder stays held when its /proc entry is recreated",
   }
 });
 
-void test("a server whose Pi died mid-startup cannot publish over the next Pi's lock", { skip: process.platform === "win32" ? "needs SIGSTOP" : false }, async () => {
+void test("a server whose Pi died mid-startup cannot publish over the next Pi's lock", { skip: process.platform === "linux" ? false : "needs /proc" }, async () => {
   const home = await mkdtemp(join(tmpdir(), "trajectory-lock-orphan-publish-"));
   const firstPort = await availablePort();
   const secondPort = await availablePort();

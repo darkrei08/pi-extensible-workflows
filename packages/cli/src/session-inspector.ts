@@ -106,7 +106,7 @@ function transcript(manager: SessionManager): TranscriptSummary {
     if (message.role === "user" && prompt === undefined) {
       const full = text(message.content);
       const marker = "\n\nTask:\n";
-      prompt = full.includes(marker) ? full.slice(full.indexOf(marker) + marker.length) : full;
+      prompt = full.startsWith("Workflow: ") && full.includes(marker) ? full.slice(full.indexOf(marker) + marker.length) : full;
     }
     if (message.role === "assistant") {
       const actualModel = modelName(message.provider, message.model);

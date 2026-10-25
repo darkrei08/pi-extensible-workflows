@@ -105,6 +105,7 @@ export interface RuntimeAgentProgress {
   readonly state?: RuntimeAgentState;
   readonly activity?: { readonly kind: "reasoning" | "tool" | "text"; readonly text: string };
   readonly lastEventAt?: number;
+  readonly speed?: { readonly messages: number; readonly outputTokens: number; readonly generationMs: number; readonly firstTokenMs: number };
   readonly persist: boolean;
 }
 
@@ -121,6 +122,8 @@ export interface RuntimeAgentRunRequest {
   readonly customTools: readonly RuntimeTool[];
   /** Explicit result schema; omitted agents use the default string workflow_result schema. */
   readonly resultSchema?: RuntimeJsonSchema;
+  /** Transient retry or budget text delivered as a separate steered message after the task, never inside it. */
+  readonly turnControl?: string;
   readonly run: RuntimeRunIdentity;
   readonly agent: RuntimeAgentIdentity;
   readonly signal: AbortSignal;

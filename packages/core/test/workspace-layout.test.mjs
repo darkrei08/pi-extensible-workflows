@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 const coreRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(coreRoot, "../..");
@@ -71,5 +73,85 @@ test("pack staging does not overwrite a package-local changelog", () => {
   } finally {
     rmSync(destination, { force: true });
     execFileSync(process.execPath, [script, "clean"]);
+  }
+});
+
+for (const cpus of [1, 2]) {
+  test(`core test runner limits parallel files to ${cpus} available CPU(s)`, () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-core-runner-"));
+    try {
+      const preload = join(root, "cpus.cjs");
+      writeFileSync(preload, `require("node:os").availableParallelism = () => ${cpus};`);
+      const traces = Array.from({ length: 4 }, (_, index) => join(root, `${index}.json`));
+      const files = traces.map((trace, index) => {
+        const file = join(root, `${index}.test.mjs`);
+        writeFileSync(file, `import { writeFileSync } from "node:fs";
+const start = Date.now();
+await new Promise((resolve) => setTimeout(resolve, 250));
+writeFileSync(${JSON.stringify(trace)}, JSON.stringify({ start, end: Date.now() }));`);
+        return file;
+      });
+      execFileSync("sh", ["-c", readPackage(resolve(coreRoot, "package.json")).scripts["test:run"]], {
+        cwd: coreRoot,
+        env: {
+          ...process.env,
+          PATH: `${dirname(process.execPath)}:${process.env.PATH}`,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${JSON.stringify(preload)}`,
+          NODE_TEST_CONTEXT: undefined,
+          TEST_FILES: files.join(" "),
+        },
+        stdio: "pipe",
+      });
+      const events = traces.flatMap((trace) => {
+        const { start, end } = readPackage(trace);
+        return [{ time: start, delta: 1 }, { time: end, delta: -1 }];
+      }).sort((left, right) => left.time - right.time || left.delta - right.delta);
+      let active = 0;
+      let peak = 0;
+      for (const { delta } of events) { active += delta; peak = Math.max(peak, active); }
+      assert.ok(peak <= cpus, `${peak} test files ran together on ${cpus} CPU(s)`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const version of ["6.3.0", "6.3.1", "7.0.0"]) {
+  test(`package audit limits the undici exception to release 6.3.0 (${version})`, () => {
+    const source = readFileSync(resolve(repositoryRoot, "scripts/verify-packed-packages.mjs"), "utf8");
+    const policy = source.match(/const ignoredAdvisories =[\s\S]*?(?=  const audit =)/)?.[0];
+    assert.ok(policy, "package audit policy not found");
+    const warnings = [];
+    const ignored = runInNewContext(`${policy}\nignoredAdvisories;`, {
+      json: () => ({ version }), root: repositoryRoot, resolve,
+      process: { stderr: { write: (message) => warnings.push(message) } },
+    });
+    for (const id of ["GHSA-4qv8-2p9j-2685", "GHSA-f72v-6w45-q472", "GHSA-xjj6-f33q-929c"]) {
+      assert.equal(ignored.has(`https://github.com/advisories/${id}`), version === "6.3.0");
+    }
+    assert.equal(ignored.has("https://github.com/advisories/GHSA-unknown"), false);
+    assert.equal(ignored.size, version === "6.3.0" ? 6 : 3);
+    assert.equal(warnings.length, version === "6.3.0" ? 1 : 0);
+  });
+}
+
+test("Trajectory browser selection prefers stable Chrome, preserving overrides and Chromium fallback", () => {
+  const source = readFileSync(resolve(coreRoot, "trajectory/test/trajectory-browser.test.ts"), "utf8");
+  const selection = source.match(/function findBrowser\(\): string \| undefined \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(selection, "browser selector not found");
+  const stable = "/usr/bin/google-chrome";
+  const snapshot = "/usr/bin/chromium";
+  for (const [override, available, expected] of [
+    [undefined, [stable, snapshot], stable],
+    ["/custom/chrome", [stable, snapshot, "/custom/chrome"], "/custom/chrome"],
+    [undefined, [snapshot], snapshot],
+    ["/missing/chrome", [stable, snapshot], stable],
+  ]) {
+    const selected = runInNewContext(`(${selection.replace("(): string | undefined", "()")})()`, {
+      process: { env: { PI_TRAJECTORY_CHROME: override } },
+      homedir: () => "/unused", readdirSync: () => [], execFileSync: () => "", join,
+      existsSync: (path) => available.includes(path),
+    });
+    assert.equal(selected, expected);
   }
 });

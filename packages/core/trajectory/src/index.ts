@@ -28,7 +28,8 @@ type TrajectoryPublisherConstructor = new (url: string) => TrajectoryPublisherCl
 
 type TrajectoryLock = { pid: number; port: number; fingerprint?: string; startedAt?: number; start?: string };
 export type TrajectoryController = {
-  open(input: TrajectoryPublisherInput): Promise<{ port: number }>;
+  /** `report` receives problems found after opening (a lost connection that cannot be restored), once per outage; without it they go to the console. */
+  open(input: TrajectoryPublisherInput, report?: (message: string) => void): Promise<{ port: number }>;
   close(): Promise<void>;
 };
 function trajectoryLockPath(agentDir: string): string { return join(agentDir, "pi-extensible-workflows", TRAJECTORY_LOCK_NAME); }
@@ -422,12 +423,19 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
   let currentInput: TrajectoryPublisherInput | undefined;
   let configuredPort: number | undefined;
   let closing = false;
+  let report: ((message: string) => void) | undefined;
+  // Under Pi's TUI a console line is written straight over the screen: report through the session when it gave a channel.
+  const reportProblem = (message: string): void => {
+    try { (report ?? console.error)(message); } catch { /* A stale session UI must not end the reconnect loop. */ }
+  };
   const transcriptRevisions = new Map<string, TranscriptRevision>();
   const pendingTranscripts = new Map<string, PendingTranscript>();
   const stopPolling = () => { if (pollTimer !== undefined) { clearInterval(pollTimer); pollTimer = undefined; } };
   const clearTranscriptRequests = () => { for (const request of pendingTranscripts.values()) clearTimeout(request.timer); pendingTranscripts.clear(); };
   let viewers = 0;
-  const startPolling = () => { stopPolling(); pollTimer = setInterval(() => { void sendState().catch((error: unknown) => { if (!closing) console.error(`Trajectory state publish failed: ${errorText(error)}`); }); }, viewers > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS); pollTimer.unref(); };
+  // One report per run of failing publishes, through the session like the reconnect report; a publish that works ends the run.
+  let publishReported = false;
+  const startPolling = () => { stopPolling(); pollTimer = setInterval(() => { void sendState().then(() => { publishReported = false; }, (error: unknown) => { if (!closing && !publishReported) { publishReported = true; reportProblem(`Trajectory state publish failed: ${errorText(error)}`); } }); }, viewers > 0 ? ACTIVE_POLL_MS : IDLE_POLL_MS); pollTimer.unref(); };
   let stateLoad: { socket: TrajectoryPublisherClient; task: Promise<void> } | undefined;
   let lastState: string | undefined;
   const publisherValue = (input: TrajectoryPublisherInput): LiveStateRecord => ({ id: publisherId(input.cwd, input.sessionId), title: `session ${input.sessionId.slice(0, 8)}`, cwd: input.cwd, sessionId: input.sessionId, connected: true });
@@ -599,6 +607,8 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
     const reconnectInput = (): { port: number; input: TrajectoryPublisherInput } | undefined => closing || socket !== undefined || currentInput === undefined || configuredPort === undefined ? undefined : { port: configuredPort, input: currentInput };
     reconnectLoop = (async () => {
       let backoff = RECONNECT_INITIAL_DELAY_MS;
+      // One report per outage: the loop ends when a connection is restored, and the next outage starts a new one.
+      let reported = false;
       while (reconnectInput() !== undefined) {
         await waitReconnect(backoff);
         const active = reconnectInput();
@@ -614,14 +624,20 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
           if (!activeSocket) throw new Error("Trajectory connection closed before state publish");
           await publishConnectedState(activeSocket, input);
           return;
-        } catch (error) { console.error(`Trajectory reconnect failed: ${errorText(error)}`); backoff = Math.min(RECONNECT_MAX_DELAY_MS, backoff * 2); }
+        } catch (error) {
+          // An attempt that fails after close() belongs to a session that is gone: its report would reach the console.
+          if (!isCurrent()) return;
+          if (!reported) { reported = true; reportProblem(`Trajectory disconnected, retrying in the background: ${errorText(error)}`); }
+          backoff = Math.min(RECONNECT_MAX_DELAY_MS, backoff * 2);
+        }
       }
     })().finally(() => { reconnectLoop = undefined; if (!closing && socket === undefined && currentInput !== undefined && configuredPort !== undefined) scheduleReconnect(); });
   };
   return {
-    async open(input) {
+    async open(input, onReport) {
       closing = false;
       currentInput = input;
+      report = onReport;
       const envPort = process.env.PI_WORKFLOW_TRAJECTORY_PORT;
       configuredPort = envPort !== undefined && /^\d+$/.test(envPort) ? trajectoryPort(Number(envPort)) : trajectoryPort(input.port);
       const server = await ensureTrajectoryServer(agentDir, configuredPort);
@@ -638,6 +654,7 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
       const reconnect = reconnectLoop;
       currentInput = undefined;
       configuredPort = undefined;
+      report = undefined;
       reconnectCancel?.();
       stopPolling();
       clearTranscriptRequests();
@@ -668,13 +685,13 @@ export function registerTrajectoryExtension(pi: TrajectoryExtensionAPI, options:
   const controller = options.controller ?? createTrajectoryController(options.agentDir ?? getAgentDir());
   const openUrl = options.openUrl ?? openTrajectoryUrl;
   let autoAttached = false;
-  const notify = (context: unknown, message: string, level: "info" | "error"): void => {
+  const notify = (context: unknown, message: string, level: "info" | "warning" | "error"): void => {
     const current = object(context) ? context : undefined;
     const ui = current && object(current.ui) ? current.ui : undefined;
     if (typeof ui?.notify === "function") Reflect.apply(ui.notify, ui, [message, level]);
   };
   const attach = async (provider: TrajectoryPublisherProvider, context: unknown): Promise<{ port: number } | undefined> => {
-    try { return await controller.open(provider(context)); }
+    try { return await controller.open(provider(context), (message) => { notify(context, message, "warning"); }); }
     catch (error) { notify(context, `Unable to attach Trajectory: ${errorText(error)}`, "error"); return undefined; }
   };
   const open = async (provider: TrajectoryPublisherProvider, context: unknown): Promise<void> => {

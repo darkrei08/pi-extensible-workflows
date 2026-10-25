@@ -38,7 +38,9 @@ Call `workflow_catalog` once to list functions and model aliases before the firs
 
 Workflow JavaScript has no imports, filesystem, network, process, or timers. Delegate that work to agents. `shell(command, options)` is the trusted host RPC for deterministic gates: it inherits the workflow or active-worktree cwd, merges string `env` overrides, and returns `{ exitCode, stdout, stderr }`; nonzero exits are results, but launch failures and timeouts fail with `SHELL_FAILED`.
 
-`await tools.<name>(args)` calls a tool of the launching Pi session directly, without an agent, with the same names and results as Pi `codemode`: an object when the tool declares an output schema, otherwise its text; other failures reject with `TOOL_FAILED`. Do not probe with `"name" in tools`; the launch checks the names a script calls. Prefer it over an agent for mechanical reads and tool calls. Workflow and subagent tools are not callable, and calls inside `withWorktree` fail.
+Use `await tools.<name>(args)` in scripts or `await ctx.tools.<name>(args)` in registered functions for direct session-tool calls. Prefer them over an agent for mechanical reads and tool calls. The shared [session-tool contract](https://vekexasia.github.io/pi-extensible-workflows/developers.html#session-tools) defines names, result shapes, errors, worktree and probing restrictions, script launch checks versus registered-function call-time checks, and replay.
+
+`await evidence(content)` explicitly stores text or JSON and returns `{ ref, sha256, path, bytes }`.
 
 Example use of `shell`:
 
@@ -125,7 +127,9 @@ return { findings, fix };
 
 ## Worktrees
 
-Use `withWorktree(name, callback)` for top-level agents that collaborate in one explicitly named worktree scope:
+Use `withWorktree(name, callback)` for agents that collaborate in one explicitly named worktree scope:
+
+Registered functions inherit the active worktree scope, including nested calls, agents, and `shell()`.
 
 ```js
 const result = await withWorktree("issue", async ({ path, branch }) => {
@@ -145,12 +149,14 @@ const results = await parallel("implementation", {
 });
 ```
 
+Registered extension functions also get `context.agent.create({ name, ... })` with the same handle rules as scripts. Handle journal identity is scoped by function invocation, branch, worktree, and name, so repeated or nested invocations and script handles never share a transcript; the prefix `function-handle/` is reserved in script names. Each turn is a separate agent node, with no automatic grouping.
+
 Registered extension functions receive `withWorktree` in context and can compose other registered functions with `context.invoke("reviewRepository", { focus: "security" }, "security-review")`. The optional label is presentation-only; journal identity remains the function name and occurrence. Their public inputs and outputs remain JSON; callbacks cannot cross the extension boundary.
 
 ## Rules
 
 - Workflow run does not inherit any of the main agent context. Keep that in mind when creating agent's prompts.
-- `model` must be a configured alias or the canonical `provider/model:thinking` form. Aliases are listed by `workflow_catalog`; prefer a suitable alias over a hardcoded model. Never guess a model identifier: verify unknown names with `pi --list-models "search term"` first, then use the fully qualified identifier it returns.
+- If `model` is specified, it must be a configured alias or the canonical `provider/model:thinking` form. Aliases are listed by `workflow_catalog`; prefer a suitable alias over a hardcoded model. Never guess a model identifier: verify unknown names with `pi --list-models "search term"` first, then use the fully qualified identifier it returns.
 - Use `log(messageString)` for brief operator status and `phase(phaseName)` to signal the start of another phase.
 - Use `parallel()` for independent tasks with different flows and `pipeline()` when every keyed item follows the same ordered stages; do not duplicate identical chains in `parallel()`. Signatures are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; keys are stable task, item, and stage names.
 - Use a JavaScript loop for repeated work; each direct `agent(...)` call gets deterministic call-site and occurrence identity.

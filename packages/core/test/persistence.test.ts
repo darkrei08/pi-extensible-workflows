@@ -8,7 +8,7 @@ import test from "node:test";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
 import { atomicWriteFile } from "../src/io.js";
 import { hasLiveSessionLease, listRunIds, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
-import { decodeTestJsonRecord, isTestRecord } from "./support.js";
+import { callUnchecked, decodeTestJsonRecord, isTestRecord } from "./support.js";
 
 const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',description:'x'}", args: { answer: 42 }, metadata: { name: "x", description: "x" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] });
 
@@ -914,4 +914,72 @@ void test("authoritative state writes survive summary projection failures", asyn
   const journal = decodeTestJsonRecord(readFileSync(join(journalStore.directory, "journal.json"), "utf8"));
   if (!isTestRecord(journal.completed)) throw new Error("Persisted journal completed entries were malformed");
   assert.deepEqual(journal.completed["agent/one"], { path: "agent/one", value: "done" });
+});
+void test("stores, dedupes, and lists evidence artifacts", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+
+  const textPayload = "Hello, world of evidence!";
+  const record1 = await store.saveEvidence(textPayload);
+  assert.match(record1.ref, /^ref:sha256:[0-9a-f]{16}$/);
+  assert.equal(record1.bytes, Buffer.byteLength(textPayload, "utf8"));
+  assert.ok(existsSync(record1.path));
+
+  // Saving identical content deduplicates
+  const record2 = await store.saveEvidence(textPayload);
+  assert.equal(record2.ref, record1.ref);
+  assert.equal(record2.sha256, record1.sha256);
+  assert.equal(record2.path, record1.path);
+
+  // JSON objects work too
+  const jsonPayload = { key: "value", number: 42 };
+  const recordJson = await store.saveEvidence(jsonPayload);
+  assert.match(recordJson.ref, /^ref:sha256:[0-9a-f]{16}$/);
+
+  // Stored content reads back through the artifact path
+  assert.equal(readFileSync(record1.path, "utf8"), textPayload);
+  assert.deepEqual(JSON.parse(readFileSync(recordJson.path, "utf8")), jsonPayload);
+
+  // List evidence
+  const list = await store.listEvidence();
+  assert.equal(list.length, 2);
+});
+void test("evidence deduplication verifies raw bytes and rejects non-JSON content", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-bytes-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const record = await store.saveEvidence("\uFFFD");
+  assert.deepEqual([...readFileSync(record.path)], [0xef, 0xbf, 0xbd]);
+  assert.equal(record.bytes, 3);
+  writeFileSync(record.path, Buffer.from([0xff]));
+  await assert.rejects(store.saveEvidence("\uFFFD"), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  assert.deepEqual([...readFileSync(record.path)], [0xff]);
+  for (const bad of [undefined, Number.NaN, { value: Number.POSITIVE_INFINITY }, { value: undefined }, 1n, () => 1, Promise.resolve("x")]) {
+    await assert.rejects(callUnchecked(store.saveEvidence.bind(store), undefined, [bad]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  assert.equal((await store.listEvidence()).length, 1);
+});
+void test("evidence deduplication rejects artifacts modified after saving", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-tamper-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const record = await store.saveEvidence("original");
+  writeFileSync(record.path, "tampered");
+  const rejected = (error: unknown): boolean => error instanceof WorkflowError && error.code === "RESULT_INVALID";
+  await assert.rejects(store.saveEvidence("original"), rejected);
+  assert.equal(readFileSync(record.path, "utf8"), "tampered");
+});
+void test("concurrent identical evidence journals one content-addressed operation", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-concurrent-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const [first, second] = await Promise.all([store.saveEvidence("same"), store.saveEvidence("same")]);
+  assert.deepEqual(first, second);
+  const operations = (await store.replayableOperations()).filter(({ path }) => path.startsWith("evidence/"));
+  assert.deepEqual(operations, [{ path: structuralPath("evidence", first.sha256), value: { ...first } }]);
 });

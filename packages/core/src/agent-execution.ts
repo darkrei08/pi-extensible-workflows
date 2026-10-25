@@ -81,7 +81,8 @@ export interface AgentExecutionOptions {
   model?: string;
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
   onAttempt?: (attempt: AgentAttempt) => void | Promise<void>;
-  providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>;
+  /** Asks how to recover from a terminal provider error; `signal` aborts when the attempt is cancelled while it asks. */
+  providerErrorRecovery?: (failure: AgentProviderFailure, signal: AbortSignal) => Promise<AgentProviderRecovery>;
   modelOverride?: ModelSpec;
   tools?: readonly string[];
   skills?: readonly string[];
@@ -909,10 +910,9 @@ async function resolvePiRuntime(): Promise<PiRuntimeResolution> {
   }
 }
 const piRuntimeResolution = resolvePiRuntime();
-function workflowAgentPrompt(task: string, options: AgentExecutionOptions, attempt: number, previousError?: string): string {
-  const basePrompt = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", options.schema ? "Call workflow_result exactly once with the final result matching its schema. Do not return prose as the final result." : "Call workflow_result exactly once with { result: \"final response\" } to submit the final response. Do not return prose as the final result.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? previousError ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
-  const instruction = options.budget?.instruction();
-  return `${basePrompt}\n\nTask:\n${task}${instruction ? `\n\n${instruction}` : ""}`;
+/** Transient per-attempt control text. It is queued as a separate steered message after the task, so the system prompt stays stable and the task message stays exact. */
+function attemptControlText(options: AgentExecutionOptions, attempt: number, previousError?: string): string {
+  return [attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? previousError ?? "failed attempt"}` : "", options.budget?.instruction() ?? ""].filter(Boolean).join("\n");
 }
 async function preparedAgentSession(input: SessionInput, initialPrompt?: string): Promise<Readonly<PreparedAgentSession>> {
   const { runtime: piRuntime, error: piRuntimeError } = await piRuntimeResolution;
@@ -936,7 +936,7 @@ async function attemptSessionInput(source: string, attempt: number): Promise<str
   await copyFile(source, target);
   return target;
 }
-async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTransport, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, inspection = false, previousError?: string): Promise<PreparedAgentSetup> {
+async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTransport, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, inspection = false): Promise<PreparedAgentSetup> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
   const baselineOptions = structuredClone(options.agentOptions ?? {});
   const baseResourcePolicy = await root.agentResourcePolicy?.();
@@ -1015,7 +1015,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
     setup.prepared = await preparedAgentSession(setup.sessionInput, task);
     return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error } };
   }
-  setup.prepared = await preparedAgentSession(setup.sessionInput, inspection ? task : workflowAgentPrompt(setup.prompt, options, attempt, previousError));
+  setup.prepared = await preparedAgentSession(setup.sessionInput, inspection ? task : setup.prompt);
   return { setup, summary: agentSetupSummary(setup, hookNames) };
 }
 export async function prepareAgentSetupForInspection(root: AgentExecutionRoot, task: string, options: AgentExecutionOptions, transport: AgentTransport): Promise<PreparedAgentSetup> {
@@ -1176,7 +1176,7 @@ export class WorkflowAgentExecutor {
       const resultSchema = Compile(options.schema ?? defaultWorkflowResultSchema);
       let resultAccepted = false;
       const resultTool = defineTool({
-        name: "workflow_result", label: "Workflow Result", description: "Submit the terminal workflow result", parameters: resultSchema.Type(),
+        name: "workflow_result", label: "Workflow Result", description: options.schema ? "Submit the terminal workflow result. Call exactly once to finish the current task or message, with a value matching the required schema. Do not return prose as the final result." : "Submit the terminal workflow result. Call exactly once to finish the current task or message, with { result: \"final response\" }. Do not return prose as the final result.", parameters: resultSchema.Type(),
         async execute(_id: string, value: unknown) {
           if (!resultSchema.Check(value) || !jsonValue(value)) return { content: [{ type: "text" as const, text: "Result does not match the required schema." }], details: {}, isError: true };
           if (resultAccepted) return { content: [{ type: "text" as const, text: "Result has already been accepted." }], details: {}, isError: true };
@@ -1187,6 +1187,9 @@ export class WorkflowAgentExecutor {
         },
       });
       let lastKnownAccounting: AgentAccounting = zeroAccounting();
+      // The attempt's counted speed from its last progress; #runOnce reports a final snapshot before onComplete and onFailure.
+      let lastSpeed: AgentAccounting["speed"];
+      const withSpeed = (value: AgentAccounting): AgentAccounting => lastSpeed === undefined ? value : { ...value, speed: lastSpeed };
       const accountingFromRuntime = (usage: RuntimeUsage, active: WorkflowAgentSession): AgentAccounting => {
         const input = usage.input;
         const output = usage.output;
@@ -1202,13 +1205,14 @@ export class WorkflowAgentExecutor {
         const complete = value.usage.availability === "complete" && values.every((entry): entry is number => typeof entry === "number" && Number.isFinite(entry));
         const reportable = complete ? value : { ...value, usage: { availability: "complete" as const, input: lastKnownAccounting.input, output: lastKnownAccounting.output, cacheRead: lastKnownAccounting.cacheRead, cacheWrite: lastKnownAccounting.cacheWrite, costUsd: lastKnownAccounting.cost } };
         const update = runtimeProgressToAgentProgress(reportable);
+        if (update.accounting.speed !== undefined) lastSpeed = update.accounting.speed;
         if (complete) lastKnownAccounting = { ...update.accounting };
         await progressHandler(update);
       } : undefined;
 
       try {
         setupFailed = true;
-        const prepared = await prepareAgentSetup(this.root, this.transport, task, options, resolved, cwd, attempt, attemptSignal, customTools, resultTool, false, attempts.at(-1)?.error?.message);
+        const prepared = await prepareAgentSetup(this.root, this.transport, task, options, resolved, cwd, attempt, attemptSignal, customTools, resultTool, false);
         setup = prepared.setup;
         const attemptSetup = prepared.setup;
         setupSummary = prepared.summary;
@@ -1272,7 +1276,7 @@ export class WorkflowAgentExecutor {
             },
             ...(runStore ? { onSystemPrompt: (entry: { readonly sessionId: string; readonly turn: number; readonly prompt: string }) => runStore.recordSystemPrompt({ ...entry, attempt }) } : {}),
             onComplete: async (result, completedSession) => {
-              const completedAccounting = accountingFromRuntime(result.usage, completedSession);
+              const completedAccounting = withSpeed(accountingFromRuntime(result.usage, completedSession));
               completedAttempt = attemptRecord(attemptSetup.transport.id, attempt, completedSession, setupSummary, completedAccounting, result.value);
               attempts.push(completedAttempt);
               try { await options.onAttempt?.(completedAttempt); }
@@ -1281,7 +1285,7 @@ export class WorkflowAgentExecutor {
             },
             onFailure: async (failure, failedSession) => {
               releaseHandoff("attempt failed");
-              const failedAccounting = accounting(failedSession.getSessionStats());
+              const failedAccounting = withSpeed(accounting(failedSession.getSessionStats()));
               const failedAttempt = attemptRecord(attemptSetup.transport.id, attempt, failedSession, setupSummary, failedAccounting, undefined, { code: failure.code, message: failure.message });
               attempts.push(failedAttempt);
               try { await options.onAttempt?.(failedAttempt); }
@@ -1292,6 +1296,7 @@ export class WorkflowAgentExecutor {
         const runtimeRun = { id: transportBase.run.runId, namespaceId: transportBase.run.sessionId, workflowName: transportBase.run.workflow.name };
         const providerRecovery = options.providerErrorRecovery;
         const runtimeAgent = { id: transportBase.identity.callSite, structuralPath: [...transportBase.identity.structuralPath], ...(options.parent ? { parentId: options.parent } : {}) };
+        const attemptControl = attemptControlText(options, attempt, attempts.at(-1)?.error?.message);
         const runtimeRequest = {
           task: setup.prepared.initialPrompt ?? setup.prompt,
           cwd: setup.prepared.cwd,
@@ -1300,6 +1305,7 @@ export class WorkflowAgentExecutor {
           // Pi sessions execute the prepared native definitions; the executor does not duplicate them as neutral request tools.
           customTools: [],
           ...(options.schema ? { resultSchema: options.schema } : {}),
+          ...(attemptControl ? { turnControl: attemptControl } : {}),
           run: runtimeRun,
           agent: runtimeAgent,
           signal: attemptSignal,
@@ -1318,7 +1324,7 @@ export class WorkflowAgentExecutor {
               return requestInstruction && !final ? options.budget?.instruction() : undefined;
             },
           } } : {}),
-          ...(providerRecovery ? { onProviderError: (failure: { provider: string; model: string; error: string }) => providerRecovery({ label: options.label, ...failure }) } : {}),
+          ...(providerRecovery ? { onProviderError: (failure: { provider: string; model: string; error: string }) => providerRecovery({ label: options.label, ...failure }, attemptSignal) } : {}),
           ...(this.root.providerPause ? { onProviderLimit: this.root.providerPause } : {}),
         } as const;
         const result = await runner.run(runtimeRequest);
@@ -1624,7 +1630,7 @@ export class FairAgentScheduler {
     const parent = this.#node(parentId);
     if (!(parent.attemptCapabilities?.tools ?? parent.options.tools).includes("agent")) return [];
     const agentTool = defineTool({
-      name: "agent", label: "Child Agent", description: "Start a direct child agent",
+      name: "agent", label: "Child Agent", description: "Start a direct child agent. You own the children you create: collect each result with get_subagent_result and do not leave descendants running.",
       parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), excludeTools: Type.Optional(Type.Array(Type.String(), { description: "Exact tool names removed after preparation; cannot remove workflow_result" })), skills: Type.Optional(Type.Array(Type.String())), extensions: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), contextFiles: Type.Optional(Type.Array(Type.String())), outputSchema: Type.Optional(Type.Record(Type.String(), Type.Unknown())), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }, { additionalProperties: true }),
       outputSchema: Type.Object({ id: Type.String() }),
       execute: async (_id, params) => {

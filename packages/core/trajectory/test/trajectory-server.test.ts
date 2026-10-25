@@ -1045,3 +1045,411 @@ void test("Trajectory tells publishers how many browsers are watching", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+type ServerSocket = import("node:stream").Duplex;
+/** Collects the server side of each upgraded socket in connection order, after the server attached its own handlers. */
+function serverSockets(server: ReturnType<typeof createTrajectoryServer>): ServerSocket[] {
+  const sockets: ServerSocket[] = [];
+  server.on("upgrade", (_request: unknown, socket: ServerSocket) => { sockets.push(socket); });
+  return sockets;
+}
+function maskedControlFrame(opcode: number, value: string): Buffer {
+  const data = Buffer.from(value);
+  assert.ok(data.length <= 125);
+  const mask = Buffer.from([5, 6, 7, 8]);
+  const body = Buffer.alloc(data.length);
+  for (let index = 0; index < data.length; index += 1) body[index] = (data[index] ?? 0) ^ (mask[index % 4] ?? 0);
+  return Buffer.concat([Buffer.from([0x80 | opcode, 0x80 | data.length]), mask, body]);
+}
+function splitIrregularly(bytes: Buffer): Buffer[] {
+  const sizes = [1, 2, 3, 5, 8, 13, 21, 4096, 1, 65_537];
+  const chunks: Buffer[] = [];
+  for (let offset = 0, index = 0; offset < bytes.length; index += 1) {
+    const size = sizes[index % sizes.length] ?? 1;
+    chunks.push(bytes.subarray(offset, offset + size));
+    offset += size;
+  }
+  return chunks;
+}
+function stateTitle(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || (value as { type?: unknown }).type !== "state") return undefined;
+  const title = (value as { publishers?: { title?: unknown }[] }).publishers?.[0]?.title;
+  return typeof title === "string" ? title : undefined;
+}
+
+void test("Trajectory parses several complete frames delivered in one chunk larger than the frame limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-coalesced-"));
+  const port = await availablePort();
+  const maxFrameBytes = 1000;
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"), { maxFrameBytes });
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const publisher = await handshake(port, origin);
+  const browser = await handshake(port, origin);
+  try {
+    const publisherSide = sides[0];
+    assert.ok(publisherSide);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await readJsonFrame(browser.socket);
+    const frames = [maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pub", padding: "p".repeat(150) })), maskedFrame(JSON.stringify({ type: "publisher:state", publisher: { id: "pub", title: "t".repeat(820) }, runs: [], subagents: [] }))];
+    const chunk = Buffer.concat(frames);
+    assert.ok(chunk.length > maxFrameBytes + 14);
+    for (const part of frames) assert.ok(part.length < maxFrameBytes);
+    publisherSide.emit("data", chunk);
+    const state = await readJsonFrame(browser.socket, (value) => stateTitle(value) !== undefined);
+    assert.equal(stateTitle(state), "t".repeat(820));
+  } finally {
+    publisher.socket.destroy();
+    browser.socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory assembles WebSocket frames split across arbitrary chunk boundaries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-chunks-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const publisher = await handshake(port, origin);
+  const browser = await handshake(port, origin);
+  try {
+    const publisherSide = sides[0];
+    assert.ok(publisherSide);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await readJsonFrame(browser.socket);
+    const attach = JSON.stringify({ type: "publisher:attach", publisherId: "pub", padding: "p".repeat(300) });
+    const title = "t".repeat(70_000);
+    const stream = Buffer.concat([maskedFrame(attach), maskedControlFrame(0x9, JSON.stringify({ ping: "one" })), maskedControlFrame(0xA, "ignored"), maskedFrame(publisherState("pub", "", [], title)), maskedControlFrame(0x9, JSON.stringify({ ping: "two" }))]);
+    assert.ok(Buffer.byteLength(attach) > 125 && Buffer.byteLength(attach) <= 0xffff);
+    // A socket drops data while no reader is attached, so the browser listens before the publisher's frames are emitted.
+    const browserState = readJsonFrame(browser.socket, (value) => stateTitle(value) !== undefined);
+    for (const chunk of splitIrregularly(stream)) publisherSide.emit("data", chunk);
+    assert.deepEqual(await readJsonFrame(publisher.socket), { ping: "one" });
+    assert.deepEqual(await readJsonFrame(publisher.socket), { ping: "two" });
+    assert.equal(stateTitle(await browserState), title);
+  } finally {
+    publisher.socket.destroy();
+    browser.socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Totals bytes copied and allocated through the public Buffer API while action runs. */
+function countBufferBytes(action: () => void): { copied: number; allocated: number } {
+  const totals = { copied: 0, allocated: 0 };
+  const saved: [object, string, PropertyDescriptor][] = [];
+  const wrap = (target: object, name: string, count: (result: unknown, args: readonly unknown[]) => void): void => {
+    const descriptor = Object.getOwnPropertyDescriptor(target, name);
+    assert.ok(descriptor && typeof descriptor.value === "function");
+    const original = descriptor.value as (...args: unknown[]) => unknown;
+    saved.push([target, name, descriptor]);
+    Object.defineProperty(target, name, { ...descriptor, value: function (this: unknown, ...args: unknown[]) { const result = Reflect.apply(original, this, args); count(result, args); return result; } });
+  };
+  try {
+    for (const name of ["alloc", "allocUnsafe", "allocUnsafeSlow"]) wrap(Buffer, name, (_result, args) => { totals.allocated += Number(args[0]); });
+    wrap(Buffer, "concat", (result) => { totals.copied += (result as Buffer).length; });
+    wrap(Buffer.prototype as object, "copy", (result) => { totals.copied += Number(result); });
+    action();
+  } finally {
+    for (const [target, name, descriptor] of saved.reverse()) Object.defineProperty(target, name, descriptor);
+  }
+  return totals;
+}
+
+void test("Trajectory copies a large frame split into small chunks a bounded number of times", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-linear-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const publisher = await handshake(port, origin);
+  try {
+    const publisherSide = sides[0];
+    assert.ok(publisherSide);
+    publisherSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pub" })));
+    const title = "z".repeat(4 * 1024 * 1024);
+    const bytes = maskedFrame(publisherState("pub", "", [], title));
+    const chunks: Buffer[] = [];
+    for (let offset = 0; offset < bytes.length; offset += 16 * 1024) chunks.push(bytes.subarray(offset, offset + 16 * 1024));
+    const { copied, allocated } = countBufferBytes(() => { for (const chunk of chunks) publisherSide.emit("data", chunk); });
+    // Reassembly once per chunk would copy about chunks.length / 2 times the frame.
+    assert.ok(copied <= 2 * bytes.length, `copied ${String(copied)} bytes for a ${String(bytes.length)} byte frame`);
+    assert.ok(allocated <= 3 * bytes.length, `allocated ${String(allocated)} bytes for a ${String(bytes.length)} byte frame`);
+    const browser = await handshake(port, origin);
+    try {
+      browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+      assert.equal(stateTitle(await readJsonFrame(browser.socket)), title);
+    } finally { browser.socket.destroy(); }
+  } finally {
+    publisher.socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Makes the next state write report a full socket buffer, as a slow browser would. */
+function backpressureNextWrite(socket: ServerSocket): void {
+  const write = socket.write.bind(socket) as (chunk: unknown) => boolean;
+  socket.write = ((chunk: unknown) => { write(chunk); delete (socket as { write?: unknown }).write; return false; }) as ServerSocket["write"];
+}
+/** Counts JSON serializations, which every state encoding performs at least once per publisher. */
+function countSerializations(action: () => void): number {
+  const stringify = JSON.stringify;
+  let count = 0;
+  JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => { count += 1; return stringify(...args); }) as typeof JSON.stringify;
+  try { action(); } finally { JSON.stringify = stringify; }
+  return count;
+}
+
+void test("Trajectory encodes only the newest state for a backpressured browser once it drains", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-backpressure-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const publisher = await handshake(port, origin);
+  const browser = await handshake(port, origin);
+  try {
+    const [publisherSide, browserSide] = sides;
+    assert.ok(publisherSide && browserSide);
+    publisherSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pub" })));
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await readJsonFrame(browser.socket);
+    backpressureNextWrite(browserSide);
+    publisher.socket.write(maskedFrame(publisherState("pub", "", [], "full")));
+    assert.equal(stateTitle(await readJsonFrame(browser.socket, (value) => stateTitle(value) !== undefined)), "full");
+    const updates = ["one", "two", "latest"].map((title) => maskedFrame(publisherState("pub", "", [], title)));
+    assert.equal(countSerializations(() => { for (const update of updates) publisherSide.emit("data", update); }), 0);
+    browserSide.emit("drain");
+    assert.equal(stateTitle(await readJsonFrame(browser.socket)), "latest");
+    publisher.socket.write(maskedFrame(publisherState("pub", "", [], "after")));
+    assert.equal(stateTitle(await readJsonFrame(browser.socket)), "after");
+  } finally {
+    publisher.socket.destroy();
+    browser.socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory marks focused timing delivered only for the state a backpressured browser receives", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-backpressure-timing-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const publisher = await handshake(port, origin);
+  const browser = await handshake(port, origin);
+  try {
+    const [publisherSide, browserSide] = sides;
+    assert.ok(publisherSide && browserSide);
+    publisherSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pub" })));
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await readJsonFrame(browser.socket);
+    publisher.socket.write(maskedFrame(timingState("pub", 7, 3)));
+    await readJsonFrame(browser.socket);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pub", runId: "focused" })));
+    assert.equal(focusedTranscript(stateFrame(await readJsonFrame(browser.socket)), "focused").timing?.length, 3);
+
+    // Revision 8 and the focus switch are replaced while the socket is full, so neither may count as delivered.
+    backpressureNextWrite(browserSide);
+    publisher.socket.write(maskedFrame(timingState("pub", 7, 3)));
+    assert.equal(focusedTranscript(stateFrame(await readJsonFrame(browser.socket)), "focused").timing, undefined);
+    const pending = [maskedFrame(timingState("pub", 8, 4)), maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pub", runId: "other" }))];
+    assert.equal(countSerializations(() => {
+      publisherSide.emit("data", pending[0]);
+      browserSide.emit("data", pending[1]);
+    }), 0);
+    browserSide.emit("drain");
+    const drained = stateFrame(await readJsonFrame(browser.socket));
+    assert.equal(focusedTranscript(drained, "other").timing?.length, 4);
+    assert.deepEqual(focusedTranscript(drained, "focused").timing, []);
+
+    backpressureNextWrite(browserSide);
+    publisher.socket.write(maskedFrame(timingState("pub", 8, 4)));
+    assert.equal(focusedTranscript(stateFrame(await readJsonFrame(browser.socket)), "other").timing, undefined);
+    const refocus = [maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pub", runId: "focused" })), maskedFrame(timingState("pub", 9, 5))];
+    assert.equal(countSerializations(() => {
+      browserSide.emit("data", refocus[0]);
+      publisherSide.emit("data", refocus[1]);
+      publisherSide.emit("data", refocus[1]);
+    }), 0);
+    browserSide.emit("drain");
+    const refocused = stateFrame(await readJsonFrame(browser.socket));
+    assert.equal(focusedTranscript(refocused, "focused").revision, 9);
+    assert.equal(focusedTranscript(refocused, "focused").timing?.length, 5);
+    publisher.socket.write(maskedFrame(timingState("pub", 9, 5)));
+    assert.equal(focusedTranscript(stateFrame(await readJsonFrame(browser.socket)), "focused").timing, undefined);
+  } finally {
+    publisher.socket.destroy();
+    browser.socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Counts serializations of each publisher's state by its id. */
+function countPublisherEncodes(ids: readonly string[], action: () => void): Record<string, number> {
+  const stringify = JSON.stringify;
+  const counts = Object.fromEntries(ids.map((id) => [id, 0]));
+  JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => {
+    const result = stringify(...args);
+    for (const id of ids) if (typeof result === "string" && result.includes(`"id":"${id}"`)) counts[id] = (counts[id] ?? 0) + 1;
+    return result;
+  }) as typeof JSON.stringify;
+  try { action(); } finally { JSON.stringify = stringify; }
+  return counts;
+}
+function titledTimingState(id: string, revision: number, title: string): Buffer {
+  const value = JSON.parse(timingState(id, revision, 3)) as { publisher: Record<string, unknown> };
+  value.publisher.title = title;
+  return maskedFrame(JSON.stringify(value));
+}
+function publisherTranscript(frame: unknown, publisherId: string, runId: string): { revision: number; timing?: unknown[] } {
+  const publisher = stateFrame(frame).publishers.find((candidate) => candidate.id === publisherId);
+  const run = publisher?.runs.find((candidate) => candidate.run.id === runId);
+  assert.ok(run);
+  return run.transcripts.agent;
+}
+function hasTitle(publisherId: string, title: string): (value: unknown) => boolean {
+  return (value) => Boolean(value && typeof value === "object" && (value as { type?: unknown }).type === "state" && (value as { publishers: { id?: unknown; title?: unknown }[] }).publishers.some((publisher) => publisher.id === publisherId && publisher.title === title));
+}
+
+void test("Trajectory serializes an unchanged publisher once for every browser and update", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-publisher-cache-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const clients = [];
+  try {
+    for (let index = 0; index < 5; index += 1) clients.push(await handshake(port, origin));
+    const [aSide, bSide, focusedSide, secondSide, legacySide] = sides;
+    assert.ok(aSide && bSide && focusedSide && secondSide && legacySide);
+    const [, , focused, second, legacy] = clients.map(({ socket }) => socket);
+    assert.ok(focused && second && legacy);
+    aSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pubA" })));
+    bSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pubB" })));
+    for (const side of [focusedSide, secondSide, legacySide]) side.emit("data", maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    for (const side of [focusedSide, secondSide]) side.emit("data", maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pubA", runId: "focused" })));
+    aSide.emit("data", titledTimingState("pubA", 7, "A-7"));
+    bSide.emit("data", titledTimingState("pubB", 1, "B-1"));
+
+    // Two focused browsers and one legacy browser watch three changes of A; unchanged B is not serialized again.
+    const aUpdates = [titledTimingState("pubA", 8, "A-8"), titledTimingState("pubA", 9, "A-9"), titledTimingState("pubA", 9, "A-9b")];
+    assert.equal(countPublisherEncodes(["pubB"], () => { for (const update of aUpdates) aSide.emit("data", update); }).pubB, 0);
+    // A focused browser that already holds A's timing reuses A; B is serialized once for focused and once for legacy browsers.
+    const bUpdate = titledTimingState("pubB", 2, "B-2");
+    assert.deepEqual(countPublisherEncodes(["pubA", "pubB"], () => { bSide.emit("data", bUpdate); }), { pubA: 0, pubB: 2 });
+
+    // Every read starts before the frames arrive, because an unread socket drops them.
+    const [focusedLatest, secondLatest, legacyLatest] = await Promise.all([focused, second, legacy].map((socket) => readJsonFrame(socket, hasTitle("pubB", "B-2"))));
+    for (const latest of [focusedLatest, secondLatest]) {
+      assert.equal(publisherTranscript(latest, "pubA", "focused").revision, 9);
+      assert.equal(publisherTranscript(latest, "pubA", "focused").timing, undefined);
+      assert.deepEqual(publisherTranscript(latest, "pubA", "other").timing, []);
+      assert.deepEqual(publisherTranscript(latest, "pubB", "focused").timing, []);
+    }
+    assert.equal(publisherTranscript(legacyLatest, "pubA", "focused").timing?.length, 3);
+    assert.equal(publisherTranscript(legacyLatest, "pubB", "focused").timing?.length, 3);
+
+    focusedSide.emit("data", maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pubB", runId: "focused" })));
+    const switched = await readJsonFrame(focused, hasTitle("pubB", "B-2"));
+    assert.equal(publisherTranscript(switched, "pubB", "focused").timing?.length, 3);
+    assert.deepEqual(publisherTranscript(switched, "pubA", "focused").timing, []);
+    // Refocusing starts a new delivery record, so A's timing ships again instead of a reused copy that omits it.
+    focusedSide.emit("data", maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pubA", runId: "focused" })));
+    const refocused = await readJsonFrame(focused, hasTitle("pubB", "B-2"));
+    assert.equal(publisherTranscript(refocused, "pubA", "focused").timing?.length, 3);
+    assert.deepEqual(publisherTranscript(refocused, "pubB", "focused").timing, []);
+  } finally {
+    for (const { socket } of clients) socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Decodes every frame a client socket receives from now on, so no frame is lost between reads. */
+function collectFrames(socket: Socket): unknown[] {
+  const frames: unknown[] = [];
+  let buffer = Buffer.alloc(0);
+  socket.on("data", (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    for (let decoded = decodeTextFrame(buffer); decoded; decoded = decodeTextFrame(buffer)) { buffer = buffer.subarray(decoded.consumed); frames.push(JSON.parse(decoded.payload)); }
+  });
+  return frames;
+}
+async function until(condition: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+const viewerCounts = (frames: readonly unknown[]): number[] => frames.filter(isViewerFrame).map((frame) => (frame as { count: number }).count);
+const stateTitles = (frames: readonly unknown[]): string[] => frames.flatMap((frame) => stateTitle(frame) ?? []);
+
+void test("Trajectory sends no state to a hidden browser, counts only visible viewers, and resumes it with the latest focused state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-hidden-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  const sides = serverSockets(server);
+  await listen(server, port);
+  const origin = `http://127.0.0.1:${String(port)}`;
+  const clients = [];
+  try {
+    for (let index = 0; index < 4; index += 1) clients.push(await handshake(port, origin));
+    const [publisherSide, visibleSide, hiddenSide, legacySide] = sides;
+    assert.ok(publisherSide && visibleSide && hiddenSide && legacySide);
+    const [publisher, visible, hidden, legacy] = clients.map(({ socket }) => collectFrames(socket));
+    assert.ok(publisher && visible && hidden && legacy);
+    publisherSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "pub" })));
+    for (const side of [visibleSide, hiddenSide, legacySide]) side.emit("data", maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    visibleSide.emit("data", maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pub", runId: "focused", visible: true })));
+    hiddenSide.emit("data", maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: null, runId: null, visible: false })));
+    publisherSide.emit("data", titledTimingState("pub", 7, "S1"));
+    await until(() => stateTitles(visible).includes("S1") && stateTitles(legacy).includes("S1"), "visible and legacy browsers to receive S1");
+    // The hidden browser's transcript reply is written after any state it was sent, so its arrival proves no state was.
+    hiddenSide.emit("data", maskedFrame(JSON.stringify({ type: "ui:transcript", requestId: "hidden-request", publisherId: "pub", runId: "focused", agentId: "agent", revision: 7 })));
+    await until(() => publisher.some((frame) => (frame as { type?: unknown }).type === "publisher:transcript"), "the transcript request to reach the publisher");
+    const request = publisher.find((frame) => (frame as { type?: unknown }).type === "publisher:transcript") as { requestId: string };
+    publisherSide.emit("data", maskedFrame(JSON.stringify({ type: "publisher:transcript-result", requestId: request.requestId, publisherId: "pub", runId: "focused", agentId: "agent", requestedRevision: 7, ok: true, status: "available", revision: 7, entries: [] })));
+    await until(() => hidden.some((frame) => (frame as { type?: unknown }).type === "transcript"), "the hidden browser's transcript reply");
+    assert.deepEqual(stateTitles(hidden), []);
+    assert.deepEqual(viewerCounts(publisher), [0, 1, 2, 3, 2]);
+
+    hiddenSide.emit("data", maskedFrame(JSON.stringify({ type: "ui:focus", publisherId: "pub", runId: "focused", visible: true })));
+    await until(() => stateTitles(hidden).includes("S1"), "the resumed browser to receive S1");
+    const resumed = hidden.find((frame) => stateTitle(frame) === "S1");
+    assert.equal(publisherTranscript(resumed, "pub", "focused").timing?.length, 3);
+    await until(() => viewerCounts(publisher).length === 6, "the visible viewer count");
+    assert.equal(viewerCounts(publisher).at(-1), 3);
+  } finally {
+    for (const { socket } of clients) socket.destroy();
+    server.closeAllConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});

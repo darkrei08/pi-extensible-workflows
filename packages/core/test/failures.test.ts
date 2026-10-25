@@ -34,7 +34,7 @@ void test("rejects global collisions, invalid metadata, schemas, input, and outp
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { run: { ...extension.functions.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
   const journal = { get: () => undefined, put: () => {} };
-  const context: WorkflowFunctionContext = { settings: {}, run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: async () => null, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context: WorkflowFunctionContext = { tools: {}, settings: {}, run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(registry.invokeFunction("run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });
@@ -229,7 +229,7 @@ void test("foreground failure results reload settled sibling agent states", asyn
       messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
       getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
       async prompt(text) {
-        if (text.includes("Task:\ngood")) { goodActive = true; await goodHold; if (goodAborted) throw new WorkflowError("CANCELLED", "good cancelled"); return; }
+        if (text === "good") { goodActive = true; await goodHold; if (goodAborted) throw new WorkflowError("CANCELLED", "good cancelled"); return; }
         throw new Error("sibling failure");
       },
       abort: async () => { if (goodActive) { goodAborted = true; releaseGood(); } },
@@ -337,7 +337,7 @@ void test("background and cold-resumed terminal failures deliver artifacts witho
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   workflowExtension(testExtensionApi({
     registerTool(tool: Tool) { tools.push(tool); },
-    registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; },
+    registerCommand(name: string, value: { handler: NonNullable<typeof command> }) { if (name === "workflow") command = value.handler; },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; },
     sendMessage(message: { content: string }) { messages.push(message.content); },
     getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"],
@@ -472,13 +472,13 @@ void test("failed retry diagnostics preserve retry provenance", async () => {
   assert.ok(workflow && retry);
   const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   await workflow.execute("retry-diagnostic-source", { name: "retry-diagnostic-source", script: `return pipeline("stages", { item: "input" }, { first: value => agent("first", {label:"first"}), second: value => agent("second", {label:"second"}) });` }, undefined, undefined, context);
-  for (let attempt = 0; attempt < 100 && diagnostics.length < 1; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  for (let attempt = 0; attempt < 1_000 && diagnostics.length < 1; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
   assert.equal(diagnostics.length, 1);
   const sourceDiagnostic = diagnostics[0];
   if (!sourceDiagnostic) throw new Error("Source failure was not delivered");
   const started = decodeTestToolResult(await retry.execute("retry-diagnostic-child", { runId: sourceDiagnostic.runId }, undefined, undefined, context));
   const childId = decodeTestRunStart(started.content[0]?.text ?? "null").runId;
-  for (let attempt = 0; attempt < 100 && !diagnostics.some((diagnostic) => diagnostic.runId === childId); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  for (let attempt = 0; attempt < 1_000 && !diagnostics.some((diagnostic) => diagnostic.runId === childId); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
   const childDiagnostic = diagnostics.find((diagnostic) => diagnostic.runId === childId);
   if (!childDiagnostic) throw new Error("Child failure was not delivered");
   const childRun = (await new RunStore(cwd, "session", childId, home).load()).run;
@@ -487,7 +487,7 @@ void test("failed retry diagnostics preserve retry provenance", async () => {
   const nextStarted = decodeTestToolResult(await retry.execute("retry-diagnostic-next-child", { runId: childId }, undefined, undefined, context));
   const nextChildId = decodeTestRunStart(nextStarted.content[0]?.text ?? "null").runId;
   let nextChild: PersistedRun | undefined;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
     nextChild = (await new RunStore(cwd, "session", nextChildId, home).load()).run;
     if (nextChild.state === "completed" || nextChild.state === "failed") break;
     await new Promise<void>((resolve) => setTimeout(resolve, 10));

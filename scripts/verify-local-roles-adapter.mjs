@@ -238,7 +238,9 @@ try {
   const standaloneFixture = await fixture({ standalone: true });
   const start = payloads.length;
   const standalone = await sdk(standaloneFixture, { prompt: "STANDALONE", role: "reviewer", mode: "foreground" }, "subagents_run");
-  assert.match(standalone.stdout, /paired-ok/); assert.equal(payloads[start].model, "role"); assert.match(JSON.stringify(payloads[start].messages), /Agent: reviewer/);
+  assert.match(standalone.stdout, /paired-ok/); assert.equal(payloads[start].model, "role");
+  assert.deepEqual(payloads[start].messages.filter(message => message.role === "user").at(-1).content, [{ type: "text", text: "STANDALONE" }]);
+  assert.match(system(payloads[start]), /ROLE_APPEND/);
   const absentStandaloneFixture = await fixture({ standalone: true, loaded: false });
   const beforeAbsentStandalone = payloads.length;
   const absentStandalone = await sdk(absentStandaloneFixture, { prompt: 'STANDALONE_OPAQUE', role: 42, mode: 'foreground' }, 'subagents_run');

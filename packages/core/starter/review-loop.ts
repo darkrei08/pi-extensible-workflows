@@ -2,7 +2,7 @@ import { Type, type Static } from "typebox";
 import {
   defineWorkflowFunction,
   type JsonValue,
-} from "pi-extensible-workflows";
+} from "../src/index.js";
 
 export const reviewLoop = defineWorkflowFunction({
   description:
@@ -17,27 +17,28 @@ export const reviewLoop = defineWorkflowFunction({
     );
     let devResult: JsonValue = null;
     let review: Static<typeof reviewSchema> = { pass: false, findings: [] };
+    // One developer keeps its transcript across iterations; each reviewer starts fresh.
+    const developer = agent.create({ name: "developer", label: "Developer", role: "developer" });
 
     for (let iterations = 1; iterations <= maxIterations; iterations += 1) {
       const devPrompt =
         iterations === 1
           ? prompt("Implement this task:\n\n{task}", { task })
           : prompt(
-              `Address the previous review findings and complete the task.
-<original_task>{task}</original_task>
+              `Address the latest review findings and complete the original task.
 <last_review>{review}</last_review>`,
-              { task, review: review.findings },
+              { review: review.findings },
             );
-      devResult = await agent(devPrompt, { role: "developer" });
+      devResult = await developer.send(devPrompt);
       review = await agent(
         prompt(
-          `Review the implementation against the task. Set pass=true only when the task is complete and correct. The developer may have addressed a previous review run of yours. So its summary is related to the last round of review if present.
+          `Review the actual current implementation against the entire original task. Inspect the code and run relevant checks yourself. Do not rely on the developer summary or on previous findings; they may be incomplete or wrong. Set pass=true only when the whole task is complete and correct.
 <original_task>{task}</original_task>
-<last_review>{review}</last_review>
+<previous_review_findings>{review}</previous_review_findings>
 <dev_summary>{devResult}</dev_summary>`,
           { task, devResult, review: review.findings },
         ),
-        { role: "reviewer", outputSchema: reviewSchema },
+        { label: `Reviewer ${String(iterations)}`, role: "reviewer", outputSchema: reviewSchema },
       );
 
       if (review.pass) return { pass: true, iterations, devResult, review };

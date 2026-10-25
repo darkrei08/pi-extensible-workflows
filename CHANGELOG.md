@@ -1,7 +1,114 @@
 # Changelog
 ## Unreleased
 
-- Concurrent Trajectory starts in one agent directory now share one server whose lock always names the process answering `/health`. A lock whose owner is alive but does not answer within the startup budget, or a lock that cannot be read, is kept and the attach fails with a clear error, instead of a second server being started beside it. Process liveness is checked against the kernel start time, not the `/proc` entry time, and Trajectory sends SIGKILL only to a process whose recorded start time still matches; a stale server that cannot be confirmed stopped keeps its lock and fails the attach.
+## [6.3.0] - 2026-10-25
+
+**This minor version contains breaking changes.** Shipping them as 6.3.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.
+
+### Breaking changes
+
+- In Pi's TUI, `/workflow` opens the `/agents` workspace on the session's runs and `/subagents` on its subagents. Their dashboards are removed (#333):
+  - `/workflow`: the run picker while the session has runs (with none it still offers `Model aliases` and `Close`), and the run dashboard: the Workflow root above the phase tree, the details column, the narrow drill-down, `enter` for run or agent actions, the action list on `a` or `A`, the inline Stop and Delete confirmation, `pgup`/`pgdn`, and `esc` back to the picker. `Model aliases` and the bulk deletes are in a run's menu.
+  - `/subagents`: the run list beside the details, the narrow drill-down, `enter` or `a` for actions, the inline Steer editor, and the inline confirmation. The bulk deletes are in the Subagents group's menu.
+  - Both: in the workspace `a` opens a node's menu; `enter` on an agent does not. Stop and deletions confirm in Pi's dialog. Outside the TUI both pickers stay.
+- `createInlineConfirm` is no longer exported. `WorkflowTui.stop()` may return `false` to cancel: `openWorkflowArtifact` then starts no editor and returns `undefined` (#333).
+- Background subagents show live only in the workflow widget: with the workflow extension not loaded, or with `backgroundWidget: false`, no live background subagent rows are shown, only the receipt each leaves when it settles. Alt+O is no longer registered as a Pi shortcut, so `/hotkeys` does not list it and it cannot be rebound: the widget takes it only while its `Alt+O to scroll` hint shows (a narrow title cuts its counts to keep the hint), otherwise the key goes on to the editor (#336).
+
+### New capabilities
+
+- Registered workflow functions can call session tools through `ctx.tools.<name>(args)`, with the same validation, hooks, result shapes and journaled replay as `tools.<name>(args)` in inline scripts. Registered functions check tool availability at call time.
+- `/agents` opens a full-screen workspace over Pi's TUI: a sidebar with this session's workflow runs (phases, operation scopes, shells, and agents) and its subagents, and beside it the selected agent's full transcript, drawn as Pi's chat draws it and updated live while the agent runs. Other nodes show their details. The hint row lists the keys; `esc` gives Pi its screen back (#332).
+- In `/agents`, `a` opens the selected node's action menu: a run's actions, then `Model aliases` and the bulk deletes; an agent's actions, registered ones such as Herdr's included; a subagent's actions; the Subagents group's bulk deletes. Copies and the external editors run in place; registered actions run detached in the TUI workspace, their working message and failure notice show in its status row (Pi's own working message is cleared when the workspace opens, and an action that settles after `/reload` or `/new` shows nothing), and their dialogs are refused there; any other action closes the workspace, runs with Pi's dialogs, and opens it again on the same node. `d` shows an agent's details instead of its transcript. Steer opens Pi's editor dialog, also in the `/subagents` picker outside the TUI (#333).
+- `/agents` marks what needs a person: `⚠ quiet` or `⚠ stalled` on a running agent or subagent without a sign of life for 3 or 10 minutes, and `◆ waiting` on a run awaiting input. `n`/`N` select the next or previous such node, failed agents and runs that have used up their budget included. The title shows the session totals (running, tokens, cost). `f` follows a running agent with its transcript at the tail, and `/` filters the sidebar by name, ID, or `state:<state>` (#334).
+- In `/agents`, the menu of a workflow agent that owns a worktree offers `Open diff in editor` (#335).
+- The workflow widget shows this session's running background subagents as a "Subagents" group after the runs, and when its tree does not fit it keeps the rows that need attention. In scroll mode Alt+O leaves scroll mode and `enter` opens `/agents` on the row's run, phase, agent, or subagent. The widget draws nothing while an agents workspace is open. A phase whose agents are all done shows the check mark while its run is running, pausing or awaiting input (#336).
+- In `/agents` and the `/subagents` picker, a failed or stopped subagent offers `Edit and retry` beside `Retry` when its request is readable: it opens the prompt in Pi's editor, then asks for a model and a retries count, and the new run keeps the edited request and model; cancelling any prompt retries nothing. A model, or an alias, that does not resolve is rejected before the run directory exists. A model that is not available is rejected there too unless agent preparation hooks are registered, because a hook may change the model: then the run fails if the prepared model is unavailable, as a fresh `subagents_run` does. A dynamic alias that resolves to an unavailable model is always rejected there, hooks or not. `Retry` itself is unchanged (#341).
+- In `/agents`, a run's and a phase's details end with a timeline of their agents, and the Subagents group's with a timeline of its subagents, with speed figures for every workflow agent and background subagent: each timeline row gets output tok/s, mean TTFT and "N tok in X s" as room allows, and a selected agent's title shows its persisted average as `N tok/s avg`; there is no live meter. Counted per attempt from assistant messages that finished normally, from the first streamed content (the first non-empty text, thinking or tool-call delta) to the end of the message, so tool time is excluded; errored, aborted, pending and deferred responses and turns handed to Herdr are not counted. TTFT is the time from the turn_start event, which Pi emits before every request, to the first non-empty delta, so it includes Pi's work and any provider queueing before the stream starts. Runs recorded before this show nothing. An agent a crash left active in a run that is not running, pausing or awaiting input is drawn interrupted, up to its last recorded event, not growing (#342).
+
+### CLI
+
+- `piewf --version` (`-v`) prints the CLI version, and `piewf --help` (`-h`, `help`) prints structured help with the commands and global options. Every command, including `inspect` and `transcript`, answers `--help`. With no arguments `piewf` prints the help on stderr, and with an unknown command `Unknown command: <name>` followed by the help, instead of the one-line usage on stdout; the exit code stays 1.
+
+### Fixes
+
+- Stopping a run (`workflow_stop`, `/workflow`) while one of its agents waits on the provider error dialog (Retry, Change model, Abort workflow) no longer waits for an answer: the attempt ends as cancelled and the dialog closes, as does Pi's searchable model picker opened from "Change model", so the next agent's provider error dialog is no longer held behind it.
+- The workflow widget no longer repaints every 125 ms: one tick a second, only while background work is live, moves its spinner and clocks, and Pi's renders on keystrokes and streamed tokens read no run file; an interrupted, paused, or budget-exhausted run, which nothing ticks, shows the runtime it recorded, as `/agents` does (#336).
+- A failed run releases its retry lineage before its `failed` state becomes visible, so a `workflow_retry` issued as soon as the state reads `failed` is no longer rejected with "An active retry already owns lineage".
+- Retention no longer stops with "Run inventory contains an unrecognized artifact" when it meets a `summary.json` that is being written. Only the exact temporary name that the atomic write uses is accepted.
+- Session shutdown waits for the terminal delivery of background runs that settled just before it, so a run's files are no longer removed while its delivery state is still being written.
+- A background run's terminal delivery that fails (a store write, reading the result) is reported as a workflow warning entry instead of an unhandled rejection that could end the Pi process. A delivery is still claimed before its content is sent, so a failure after the claim is not retried.
+- A workflow message delivered while the session shuts down (for example the result of a run that settled just before, or the failure of a run the shutdown interrupted) is still recorded in the session but no longer starts a turn in it.
+- A shell command, tool call or agent is recorded in the phase that was current when the script (or a registered function, through `context.phase` with `context.shell` or `context.agent`) started it, even if it is unawaited and a later `phase(name)` follows before it runs. A phase update waits for the calls started before it to record their start, not to finish. A failed phase update still rejects `phase()` and does not stop later work.
+- On macOS and Windows, a session lease or standalone subagent record whose owner was stamped before the last system boot is treated as abandoned, so a pid reused after a reboot no longer keeps it `running`.
+- A workflow whose source and args exceed the operating system's command-line limit launches. The worker received them as a single process argument, so on Windows a script of about 28 KB failed with `spawn ENAMETOOLONG` (under 9 KB when it was mostly double quotes, which grow fourfold when quoted), and on Linux script and args over 128 KiB failed with `spawn E2BIG`. They now reach the worker as a file in its private temporary directory, which also keeps them out of the process list, where other local users could read them.
+- A run whose workflow worker cannot be started, at launch or on resume, ends `failed` with the error instead of being left `running` with no error recorded. This happens when the worker's temporary directory cannot be created, or when the operating system refuses to start the process, as Linux does for an environment variable over 128 KiB. The worker's temporary directory is no longer left behind.
+
+### Trajectory fixes
+
+- Trajectory no longer keeps showing a stale run, for example a finished run as still running, when a run's `state.json` or `journal.json` was written while it was being read or twice within one filesystem timestamp tick. The run cache now stamps those files by inode, modification time and size before it reads them.
+- The Trajectory server no longer drops a publisher whose TCP chunk carries several complete WebSocket frames that together exceed the frame limit. Only the unfinished frame left after parsing is bounded, and an oversized receive buffer is trimmed after each chunk.
+
+### Documentation
+
+- The settings reference lists `codemodeTools` (global settings only) and `retention`, and says that `workflow.js` and the other files opened in the external editor are temporary copies whose edits are not kept (#331).
+
+### Known security issues
+
+- Pi 1.0.0 still pins vulnerable undici 8.10.2. For this release only, the operator accepted two moderate advisories (GHSA-4qv8-2p9j-2685, GHSA-f72v-6w45-q472) and one high advisory (GHSA-xjj6-f33q-929c). Package verification warns and exempts only those three; other advisories still block publication. No dependency fix or Pi repack is included, and #354 remains open. The exception expires at the next version.
+
+### Internal
+
+- Core test file parallelism is capped by Node's available CPU count, up to 20 files, instead of always launching 20 in parallel. Browser and worktree test deadlines are unchanged.
+- Trajectory browser verification prefers installed stable Google Chrome over the runner's snapshot Chromium build, preserving `PI_TRAJECTORY_CHROME` overrides and the Chromium fallback.
+- Core reads a Pi session file whole, as Pi does, and the complete lines its agent appends to it, and draws its records with Pi's own chat components, for the `/agents` transcript pane (#331).
+
+## [6.2.2] - 2026-10-18
+
+### Fixes
+
+- Workflow evidence uses an explicit `evidence(content)` API with JSON validation, checksum verification, pause/cancellation lifecycle gates, and replay-safe records across retries. Cleanup and retention validate artifacts while avoiding repeated hashing of unchanged files.
+- Final workflow tool results are frozen to prevent later mutation.
+
+### Documentation
+
+- Clarified that registered functions inherit the active worktree scope, including nested calls, agents, and shell commands.
+
+### Trajectory fixes
+
+- The Trajectory server assembles large WebSocket frames in a reusable buffer instead of recopying the partial frame on every TCP chunk, and a slow browser keeps only the newest state until its socket drains instead of serializing every replaced snapshot. A 16 MiB publisher frame now costs about one copy instead of about 130.
+- A running workflow no longer republishes its whole Trajectory state every poll just because its live duration advanced. While running, Trajectory carries the persisted duration and the browser keeps deriving runtime from the clock, rescaling the gantt as the timeline grows. Real changes (state, usage, agents, and persisted updates) still publish on the next poll, and finished runs show their exact duration.
+- The Trajectory server serializes each publisher's state once and shares it across browsers and later updates until that publisher changes, so one changing session no longer re-encodes every other session for every open browser.
+- A hidden Trajectory tab receives no state updates and no longer counts as a viewer, so with only hidden tabs open publishers return to their idle poll. Showing the tab sends the latest state at once, keeping its selection.
+
+## [6.2.1] - 2026-10-13
+
+### New capabilities
+
+- Registered functions can create persistent agent handles with `context.agent.create({ name, ... })` and `handle.send(...)`, with the same rules as scripts. Handle journal identity is scoped by function invocation, branch, worktree, and name. The bundled `reviewLoop` now uses one persistent developer and a fresh reviewer each iteration.
+
+### Fixes
+
+- Trajectory displays agent and system prompts as complete escaped plain text, so XML-style sections such as `<addendum>`, `<skills>`, and `<project_context>` remain visible instead of being interpreted as HTML inside Markdown. Browser regressions verify line breaks and safe rendering.
+- `agent(...)` and `handle.send(...)` now deliver the supplied text as the whole user message, on first and later turns. The repeated Workflow/Agent/Phase/Parent header, ownership paragraph, and `Task:` wrapper are gone. The `workflow_result` once-per-turn contract moved into that tool's description, child ownership into the `agent` tool description, and retry or soft-budget notes into separate control text after the task (a steered message on local sessions, appended to the pane launch prompt on Herdr; custom transports that do not set `turnControlDelivered` get the steered message). The system prompt is unchanged, so prompt caching is unaffected.
+
+### Documentation and metadata
+
+- Clarified that the workflow `model` option is optional; omitting it uses the configured defaults.
+- Updated the core package description and keywords to include codemode scripts.
+
+## [6.2.0] - 2026-10-10
+
+### New capabilities
+
+- Selecting a phase or registered function in the workflow navigator now shows total tokens, cost, and elapsed time across all its agents, including nested agents (#318).
+
+### Fixes
+
+- Launch now checks static agent calls inside registered functions that the script calls by name, so an unknown model for a later agent fails before the workflow starts. A computed `outputSchema` no longer makes a call dynamic (#309).
+- On Linux, session lease liveness uses the process start time from `/proc/<pid>/stat` instead of the `/proc/<pid>` entry time, so a live session owner is no longer reported dead (#307).
+- In the wide workflow navigator, the details column follows the scrolled tree, so details for a selected node further down a long workflow stay visible (#317).
+- Model references keep colon-bearing and namespaced model IDs, such as `openrouter/deepseek/deepseek-v4.1-flash:nitro:high`. The final `:` segment is read as a thinking level only when it names one, so `provider/model:turbo` now fails as `INVALID_METADATA` instead of `UNKNOWN_MODEL` (#314).
+- Concurrent Trajectory starts in one agent directory now share one server whose lock always names the process answering `/health`. A lock whose owner is alive but does not answer within the startup budget, or a lock that cannot be read, is kept and the attach fails with a clear error, instead of a second server being started beside it. Process liveness is checked against the kernel start time, not the `/proc` entry time, and Trajectory sends SIGKILL only to a process whose recorded start time still matches; a stale server that cannot be confirmed stopped keeps its lock and fails the attach (#315).
 
 ## [6.1.0] - 2026-10-08
 

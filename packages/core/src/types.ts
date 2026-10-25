@@ -1,5 +1,6 @@
 import type { CreateAgentSessionOptions, InlineExtension, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
+import { addSpeed } from "./agent-speed.js";
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
 export type RunState = (typeof RUN_STATES)[number];
@@ -129,9 +130,13 @@ export interface AgentResourceInspection { selectors: AgentResourceSelectorSet; 
 export interface ContextFile { readonly path: string; readonly content: string }
 export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: string }
 export const WORKFLOW_AGENT_STALL_THRESHOLD_MS = 10 * 60 * 1000;
-export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+export interface AgentSpeed { messages: number; outputTokens: number; generationMs: number; firstTokenMs: number }
+export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; speed?: AgentSpeed }
 export function zeroAccounting(): AgentAccounting { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }; }
-export function addAccounting(left: AgentAccounting, right: AgentAccounting): AgentAccounting { return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, cost: left.cost + right.cost }; }
+export function addAccounting(left: AgentAccounting, right: AgentAccounting): AgentAccounting {
+  const speed = addSpeed(left.speed, right.speed);
+  return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, cost: left.cost + right.cost, ...(speed === undefined ? {} : { speed }) };
+}
 export function sumAccounting(values: Iterable<AgentAccounting>): AgentAccounting {
   let total = zeroAccounting();
   for (const value of values) total = addAccounting(total, value);
@@ -229,9 +234,15 @@ export interface LaunchSnapshot {
 }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; }; schemas: readonly JsonSchema[] }
-export interface WorkflowOrchestrationContext { agent: { <Schema extends TSchema>(prompt: string, options: Readonly<AgentOptions<Schema> & { outputSchema: Schema }>): Promise<Static<Schema>>; (prompt: string, options?: Readonly<AgentOptions>): Promise<JsonValue> }; shell: (command: string, options?: ShellOptions) => Promise<ShellResult>; prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string; parallel: <Tasks extends ParallelTasks>(operationName: string, tasks: Tasks) => Promise<ParallelResult<Tasks>>; pipeline: <Items extends PipelineItems, Output extends JsonValue>(operationName: string, items: Items, stages: PipelineStages<Items[keyof Items], Output>) => Promise<PipelineResult<Items, Output>>; withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>) => Promise<Result>; checkpoint: (input: CheckpointInput) => Promise<boolean>; phase: (name: string) => void; log: (message: string) => void }
+export interface AgentHandleSendOptions<Schema extends TSchema = never> { outputSchema?: JsonSchema | Schema; timeoutMs?: number | null }
+/** A persistent agent: each send continues the transcript of the previous completed turn. Sends must be awaited one at a time, in the scope that created the handle. */
+export interface AgentHandle {
+  readonly name: string;
+  send: { <Schema extends TSchema>(prompt: string, options: Readonly<AgentHandleSendOptions<Schema> & { outputSchema: Schema }>): Promise<Static<Schema>>; (prompt: string, options?: Readonly<AgentHandleSendOptions>): Promise<JsonValue> };
+}
+export interface WorkflowOrchestrationContext { agent: { <Schema extends TSchema>(prompt: string, options: Readonly<AgentOptions<Schema> & { outputSchema: Schema }>): Promise<Static<Schema>>; (prompt: string, options?: Readonly<AgentOptions>): Promise<JsonValue>; create: (options: Readonly<AgentOptions & { name: string }>) => AgentHandle }; shell: (command: string, options?: ShellOptions) => Promise<ShellResult>; prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string; parallel: <Tasks extends ParallelTasks>(operationName: string, tasks: Tasks) => Promise<ParallelResult<Tasks>>; pipeline: <Items extends PipelineItems, Output extends JsonValue>(operationName: string, items: Items, stages: PipelineStages<Items[keyof Items], Output>) => Promise<PipelineResult<Items, Output>>; withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>) => Promise<Result>; checkpoint: (input: CheckpointInput) => Promise<boolean>; phase: (name: string) => void; log: (message: string) => void; evidence?: (content: string | JsonValue) => Promise<EvidenceRecord> }
 export interface WorkflowRunContext { cwd: string; sessionId: string; runId: string; workflow: Readonly<WorkflowMetadata>; args: JsonValue; signal: AbortSignal }
-export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { run: Readonly<WorkflowRunContext>; settings: Readonly<WorkflowExtensionSettings>; invoke: (name: string, input: Readonly<Record<string, JsonValue>>, label?: string) => Promise<JsonValue> }
+export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { tools: Record<string, (args: Record<string, JsonValue>) => Promise<JsonValue>>; run: Readonly<WorkflowRunContext>; settings: Readonly<WorkflowExtensionSettings>; invoke: (name: string, input: Readonly<Record<string, JsonValue>>, label?: string) => Promise<JsonValue> }
 export type WorkflowWorktreeCallback<Result extends JsonValue = JsonValue> = (reference: Readonly<WorkflowWorktreeReference>) => Result | Promise<Result>;
 export interface WorkflowFunction { description: string; input: WorkflowSchema; output: WorkflowSchema; run(input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>): unknown }
 type TypedWorkflowFunction<InputSchema extends TSchema, OutputSchema extends TSchema> = {
@@ -264,6 +275,8 @@ export interface WorkflowAgentSession {
   getState(): Readonly<WorkflowAgentSessionState>;
   getSessionStats(): WorkflowAgentSessionStats;
   getLastAssistant(): WorkflowAgentMessage | undefined;
+  /** Set by a transport that already delivered `PreparedAgentSession.turnControl` itself; otherwise the runner steers it before the first prompt. */
+  readonly turnControlDelivered?: boolean;
   subscribe(listener: (event: WorkflowAgentSessionEvent) => void): () => void;
   subscribeAsync?(listener: (event: WorkflowAgentSessionEvent) => void | Promise<void>): () => void;
   prompt(text: string): Promise<WorkflowAgentTurnResult>;
@@ -307,6 +320,8 @@ export interface PreparedAgentSession {
   readonly sessionLabel: string;
   readonly sessionPath?: string;
   readonly initialPrompt?: string;
+  /** Dynamic per-attempt control text (retry state, budget). The runner steers it before the first prompt unless the session reports `turnControlDelivered`. */
+  readonly turnControl?: string;
   readonly agentDir?: string;
   readonly customTools?: readonly ToolDefinition[];
   readonly resultTool?: ToolDefinition;
@@ -394,7 +409,8 @@ export interface AgentIdentity { structuralPath: readonly string[]; callSite: st
 export interface ShellIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; worktreeOwner?: string }
 /** A script `tools.<id>(args)` call: the n-th call of that tool within one structural scope. */
 export interface ToolIdentity { structuralPath: readonly string[]; occurrence: number }
-export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void>; tool?: (identifier: string, args: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: ToolIdentity) => Promise<JsonValue> }
+export interface EvidenceRecord { ref: string; sha256: string; path: string; bytes: number }
+export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void>; tool?: (identifier: string, args: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: ToolIdentity) => Promise<JsonValue>; evidence?: (content: string | JsonValue, signal: AbortSignal) => Promise<EvidenceRecord> }
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
 export interface StaticWorkflowScope { kind: "parallel" | "pipeline"; name: string | null; key: string | null }
 export type StaticWorkflowExecution = "parallel" | "sequential";

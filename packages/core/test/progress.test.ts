@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -182,6 +182,44 @@ void test("terminal inline progress freezes stale child animation and stall dura
     assert.equal(rerendered.render(200).join("\n"), initial);
   } finally {
     Date.now = previousNow;
+  }
+});
+void test("final detached workflow progress freezes while partial running progress animates", () => {
+  const previousNow = Date.now;
+  let now = 12 * 60 * 60 * 1000;
+  Date.now = () => now;
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-detached-progress-"));
+  const state: { workflowSpinner?: ReturnType<typeof setInterval> } = {};
+  try {
+    const tools: Array<{ name: string; renderResult?: (result: unknown, options: unknown, theme: unknown, context: unknown) => { render: (width: number) => string[] } }> = [];
+    workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+    const tool = tools.find(({ name }) => name === "workflow");
+    assert.ok(tool?.renderResult);
+    const child = makeAgent({ activity: { kind: "text", text: "responding" }, lastEventAt: now - WORKFLOW_AGENT_STALL_THRESHOLD_MS });
+    const run = makeRun({ cwd: home, agents: [child], activeShells: 1, activeShellStartedAt: now });
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const context = { state, cwd: home, invalidate: () => {} };
+    const partial = tool.renderResult({ content: [], details: { run } }, { expanded: false, isPartial: true }, theme, context);
+    const initialPartial = partial.render(200);
+    assert.ok(state.workflowSpinner);
+    now += 80;
+    assert.notEqual(partial.render(200)[0], initialPartial[0]);
+    now += 60_000;
+    assert.match(partial.render(200).join("\n"), /runtime=1m/);
+
+    const result = { content: [{ type: "text", text: "Moved workflow run to background." }], details: { runId: run.id, run, detached: true } };
+    const final = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+    assert.equal(state.workflowSpinner, undefined);
+    const initialFinal = final.render(200);
+    for (const advanceMs of [80, 60_000, 60 * 60 * 1000]) {
+      now += advanceMs;
+      assert.deepEqual(final.render(200), initialFinal);
+      assert.deepEqual(tool.renderResult(result, { expanded: false, isPartial: false }, theme, context).render(200), initialFinal);
+    }
+  } finally {
+    if (state.workflowSpinner) clearInterval(state.workflowSpinner);
+    Date.now = previousNow;
+    rmSync(home, { recursive: true, force: true });
   }
 });
 void test("final failure rendering clears inline progress invalidations", async () => {

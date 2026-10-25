@@ -15,7 +15,7 @@ const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 type Socket = import("node:stream").Duplex;
 type ClientKind = "publisher" | "browser";
 type RunFocus = { publisherId: string; runId: string };
-type Client = { socket: Socket; kind: ClientKind; publisherId?: string; buffer: Buffer; pendingState: Buffer | undefined; pendingDeliver: (() => void) | undefined; backpressured: boolean; superseded: boolean; focusAware?: boolean; focus?: RunFocus; sentTiming?: Map<string, number> };
+type Client = { socket: Socket; kind: ClientKind; publisherId?: string; buffer: Buffer; buffered: number; pendingState: State | undefined; backpressured: boolean; superseded: boolean; focusAware?: boolean; hidden?: boolean; focus?: RunFocus; sentTiming?: Map<string, number>; focusedJson?: { publisher: object; sentTiming: Map<string, number>; json: string } };
 type State = { type: "state"; publishers: readonly unknown[]; updatedAt: number; initial?: boolean; truncated?: boolean };
 type PendingRequest = { requestId: string; kind: "transcript" | "action"; browser: Client; publisherId: string; publisher: Client; target: { runId?: string; agentId?: string; subagentId?: string; revision?: number }; timer: ReturnType<typeof setTimeout> };
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
@@ -74,31 +74,27 @@ function forgetTiming(run: unknown, prefix: string, sent: Map<string, number>): 
   if (!record.transcripts || typeof record.transcripts !== "object" || Array.isArray(record.transcripts)) return;
   for (const id of Object.keys(record.transcripts)) sent.delete(`${prefix}\t${id}`);
 }
-/** Tool-timing only drives the focused run's gantt, so every other run ships without it. */
-function focusedState(state: State, focus: RunFocus | undefined, sent?: Map<string, number>, mark: (key: string, revision: number) => void = () => {}): State {
-  return {
-    ...state,
-    publishers: state.publishers.map((publisher) => {
-      if (!publisher || typeof publisher !== "object" || Array.isArray(publisher)) return publisher;
-      const value = publisher as { id?: unknown; runs?: unknown };
-      const runs: readonly unknown[] | undefined = Array.isArray(value.runs) ? value.runs as readonly unknown[] : undefined;
-      if (!runs) return publisher;
-      const focusedPublisher = focus !== undefined && value.id === focus.publisherId;
-      return { ...value, runs: runs.map((run) => {
-        const id = run && typeof run === "object" && !Array.isArray(run) ? (run as { run?: { id?: unknown } }).run?.id : undefined;
-        const prefix = `${String(value.id)}\t${String(id)}`;
-        if (!focusedPublisher || id !== focus.runId) { if (sent) forgetTiming(run, prefix, sent); return withoutTiming(run); }
-        return sent ? knownTiming(run, prefix, sent, mark) : run;
-      }) };
-    }),
-  };
+function isFocusedPublisher(publisher: unknown, focus: RunFocus | undefined): boolean {
+  return focus !== undefined && Boolean(publisher && typeof publisher === "object" && !Array.isArray(publisher)) && (publisher as { id?: unknown }).id === focus.publisherId;
 }
-function compactPublishers(publishers: readonly unknown[]): unknown[] {
-  return publishers.map((publisher) => {
-    if (!publisher || typeof publisher !== "object" || Array.isArray(publisher)) return publisher;
-    const value = publisher as { runs?: unknown; subagents?: unknown };
-    return { ...value, ...(Array.isArray(value.runs) ? { runs: value.runs.map(compactRun) } : {}), ...(Array.isArray(value.subagents) ? { subagents: value.subagents.map(compactSubagent) } : {}) };
-  });
+/** Tool-timing only drives the focused run's gantt, so every other run ships without it. */
+function focusedPublisher(publisher: unknown, focus: RunFocus | undefined, sent?: Map<string, number>, mark: (key: string, revision: number) => void = () => {}): unknown {
+  if (!publisher || typeof publisher !== "object" || Array.isArray(publisher)) return publisher;
+  const value = publisher as { id?: unknown; runs?: unknown };
+  const runs: readonly unknown[] | undefined = Array.isArray(value.runs) ? value.runs as readonly unknown[] : undefined;
+  if (!runs) return publisher;
+  const focused = isFocusedPublisher(publisher, focus);
+  return { ...value, runs: runs.map((run) => {
+    const id = run && typeof run === "object" && !Array.isArray(run) ? (run as { run?: { id?: unknown } }).run?.id : undefined;
+    const prefix = `${String(value.id)}\t${String(id)}`;
+    if (!focused || id !== focus?.runId) { if (sent) forgetTiming(run, prefix, sent); return withoutTiming(run); }
+    return sent ? knownTiming(run, prefix, sent, mark) : run;
+  }) };
+}
+function compactPublisher(publisher: unknown): unknown {
+  if (!publisher || typeof publisher !== "object" || Array.isArray(publisher)) return publisher;
+  const value = publisher as { runs?: unknown; subagents?: unknown };
+  return { ...value, ...(Array.isArray(value.runs) ? { runs: value.runs.map(compactRun) } : {}), ...(Array.isArray(value.subagents) ? { subagents: value.subagents.map(compactSubagent) } : {}) };
 }
 const MAX_METADATA_STRING_BYTES = 64 * 1024;
 const MAX_METADATA_ARRAY_ENTRIES = 256;
@@ -133,7 +129,7 @@ function tinyPublisher(publisher: unknown): unknown {
   const value = publisher as Record<string, unknown>;
   return { id: typeof value.id === "string" ? value.id.slice(0, 200) : "publisher", title: typeof value.title === "string" ? value.title.slice(0, 200) : undefined, cwd: typeof value.cwd === "string" ? value.cwd.slice(0, 1024) : undefined, sessionId: typeof value.sessionId === "string" ? value.sessionId.slice(0, 200) : undefined, connected: value.connected === true };
 }
-function encodePublisherList(publishers: readonly unknown[], updatedAt: number, maxBytes: number, initial: boolean, truncated: boolean, projector: (publisher: unknown) => unknown, fallback?: (publisher: unknown) => unknown): { serialized: string; truncated: boolean } {
+function encodePublisherList(publishers: readonly unknown[], updatedAt: number, maxBytes: number, initial: boolean, truncated: boolean, serialize: (publisher: unknown) => string, fallback?: (publisher: unknown) => string): { serialized: string; truncated: boolean } {
   const prefix = `{"type":"state","publishers":[`;
   const suffix = (isTruncated: boolean): string => `],"updatedAt":${String(updatedAt)}${initial ? ",\"initial\":true" : ""}${isTruncated ? ",\"truncated\":true" : ""}}`;
   const markerBytes = Buffer.byteLength(suffix(true)) - Buffer.byteLength(suffix(false));
@@ -142,10 +138,10 @@ function encodePublisherList(publishers: readonly unknown[], updatedAt: number, 
   let wasTruncated = truncated;
   for (const publisher of publishers) {
     let serialized: string;
-    try { serialized = JSON.stringify(projector(publisher)); } catch { wasTruncated = true; continue; }
+    try { serialized = serialize(publisher); } catch { wasTruncated = true; continue; }
     let nextBytes = bytes + Buffer.byteLength(serialized) + (parts.length ? 1 : 0);
     if (nextBytes + markerBytes >= maxBytes && fallback !== undefined) {
-      try { serialized = JSON.stringify(fallback(publisher)); } catch { wasTruncated = true; continue; }
+      try { serialized = fallback(publisher); } catch { wasTruncated = true; continue; }
       nextBytes = bytes + Buffer.byteLength(serialized) + (parts.length ? 1 : 0);
     }
     if (nextBytes + markerBytes >= maxBytes) { wasTruncated = true; continue; }
@@ -156,12 +152,12 @@ function encodePublisherList(publishers: readonly unknown[], updatedAt: number, 
   if (Buffer.byteLength(serialized) < maxBytes) return { serialized, truncated: wasTruncated };
   return { serialized: `${prefix}${suffix(true)}`, truncated: true };
 }
-function encodeState(state: State, maxBytes: number): string {
+/** `serialize` must equal `JSON.stringify(project(publisher))`; it may return a copy encoded earlier for the same publisher state. */
+function encodeState(state: State, maxBytes: number, project: (publisher: unknown) => unknown = compactPublisher, serialize: (publisher: unknown) => string = (publisher) => JSON.stringify(project(publisher))): string {
   const initial = state.initial === true;
-  const compactedPublishers = compactPublishers(state.publishers);
-  const full = encodePublisherList(compactedPublishers, state.updatedAt, maxBytes, initial, state.truncated === true, (publisher) => publisher);
+  const full = encodePublisherList(state.publishers, state.updatedAt, maxBytes, initial, state.truncated === true, serialize);
   if (!full.truncated) return full.serialized;
-  return encodePublisherList(compactedPublishers, state.updatedAt, maxBytes, initial, true, minimalPublisher, tinyPublisher).serialized;
+  return encodePublisherList(state.publishers, state.updatedAt, maxBytes, initial, true, (publisher) => JSON.stringify(minimalPublisher(project(publisher))), (publisher) => JSON.stringify(tinyPublisher(project(publisher)))).serialized;
 }
 function encodeApplication(value: unknown, maxBytes: number): string {
   let serialized: string;
@@ -187,52 +183,62 @@ function isState(value: unknown): value is State {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { type?: unknown }).type === "state");
 }
 
-function writeFrame(client: Client, packet: Buffer, state: boolean, onDelivered?: () => void): void {
-  // A superseded pending frame is never sent, so its payload must not count as delivered.
-  if (state && client.backpressured) { client.pendingState = packet; client.pendingDeliver = onDelivered; return; }
+function writeFrame(client: Client, packet: Buffer, onDelivered?: () => void): void {
   try {
-    if (state) { client.pendingState = undefined; client.pendingDeliver = undefined; }
     if (!client.socket.write(packet)) client.backpressured = true;
     onDelivered?.();
   } catch { client.socket.destroy(); }
 }
 
 function send(client: Client, value: unknown, maxBytes: number): void {
-  try {
-    const state = isState(value);
-    const packet = frame(state ? encodeState(value, maxBytes) : encodeApplication(value, maxBytes), maxBytes);
-    writeFrame(client, packet, state);
-  } catch { client.socket.destroy(); }
+  try { writeFrame(client, frame(encodeApplication(value, maxBytes), maxBytes)); } catch { client.socket.destroy(); }
+}
+
+/** Grows the receive buffer geometrically, so assembling a frame from many chunks copies each byte a bounded number of times. */
+function reserve(client: Client, bytes: number, maxBytes: number): void {
+  if (bytes <= client.buffer.length) return;
+  const grown = Buffer.allocUnsafe(Math.max(bytes, Math.min(maxBytes + 14, client.buffer.length * 2)));
+  client.buffer.copy(grown, 0, 0, client.buffered);
+  client.buffer = grown;
 }
 
 function parseFrames(client: Client, chunk: Buffer, maxBytes: number): readonly string[] {
-  client.buffer = Buffer.concat([client.buffer, chunk]);
-  if (client.buffer.length > maxBytes + 14) throw new Error("Trajectory WebSocket buffer is too large");
+  // A chunk may carry several complete frames; only the unfinished frame left after parsing is bounded.
+  reserve(client, client.buffered + chunk.length, maxBytes);
+  client.buffered += chunk.copy(client.buffer, client.buffered);
   const messages: string[] = [];
-  while (client.buffer.length >= 2) {
-    const first = client.buffer[0] ?? 0;
-    const second = client.buffer[1] ?? 0;
+  let start = 0;
+  let needed = 2;
+  while (client.buffered - start >= 2) {
+    const buffer = client.buffer.subarray(start, client.buffered);
+    const first = buffer[0] ?? 0;
+    const second = buffer[1] ?? 0;
     const opcode = first & 0x0f;
     const masked = (second & 0x80) !== 0;
     if ((first & 0x70) !== 0 || (first & 0x80) === 0 || !masked) throw new Error("Invalid Trajectory WebSocket frame");
     let offset = 2;
     let length = second & 0x7f;
-    if (length === 126) { if (client.buffer.length < 4) break; length = client.buffer.readUInt16BE(2); offset = 4; }
-    else if (length === 127) { if (client.buffer.length < 10) break; const longLength = client.buffer.readBigUInt64BE(2); if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Trajectory WebSocket frame is too large"); length = Number(longLength); offset = 10; }
+    if (length === 126) { if (buffer.length < 4) { needed = 4; break; } length = buffer.readUInt16BE(2); offset = 4; }
+    else if (length === 127) { if (buffer.length < 10) { needed = 10; break; } const longLength = buffer.readBigUInt64BE(2); if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Trajectory WebSocket frame is too large"); length = Number(longLength); offset = 10; }
     if (length >= maxBytes) throw new Error("Trajectory WebSocket frame is too large");
     if (opcode >= 0x8 && (length > 125 || (first & 0x80) === 0)) throw new Error("Invalid Trajectory WebSocket control frame");
-    if (client.buffer.length < offset + 4 + length) break;
-    const mask = client.buffer.subarray(offset, offset + 4); offset += 4;
-    const data = client.buffer.subarray(offset, offset + length);
-    client.buffer = client.buffer.subarray(offset + length);
+    if (buffer.length < offset + 4 + length) { needed = offset + 4 + length; break; }
+    const mask = buffer.subarray(offset, offset + 4); offset += 4;
+    const data = buffer.subarray(offset, offset + length);
+    start += offset + length;
     if (opcode === 0x8) { client.socket.end(); break; }
-    if (opcode === 0x9) { const pong = Buffer.alloc(2 + length); pong[0] = 0x8a; pong[1] = length; for (let index = 0; index < length; index += 1) pong[index + 2] = (data[index] ?? 0) ^ (mask[index % 4] ?? 0); writeFrame(client, pong, false); continue; }
+    if (opcode === 0x9) { const pong = Buffer.alloc(2 + length); pong[0] = 0x8a; pong[1] = length; for (let index = 0; index < length; index += 1) pong[index + 2] = (data[index] ?? 0) ^ (mask[index % 4] ?? 0); writeFrame(client, pong); continue; }
     if (opcode === 0xA) continue;
     if (opcode !== 0x1) throw new Error("Unsupported Trajectory WebSocket frame");
     const decoded = Buffer.alloc(length);
     for (let index = 0; index < length; index += 1) decoded[index] = (data[index] ?? 0) ^ (mask[index % 4] ?? 0);
     messages.push(decoded.toString("utf8"));
   }
+  // Only the unfinished frame moves to the front, and the buffer is sized for it once its header is known.
+  if (start > 0) { client.buffer.copy(client.buffer, 0, start, client.buffered); client.buffered -= start; }
+  if (client.buffered > maxBytes + 14) throw new Error("Trajectory WebSocket buffer is too large");
+  if (client.buffer.length > maxBytes + 14) { const trimmed = Buffer.allocUnsafe(maxBytes + 14); client.buffer.copy(trimmed, 0, 0, client.buffered); client.buffer = trimmed; }
+  reserve(client, needed, maxBytes);
   return messages;
 }
 
@@ -300,7 +306,7 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
   const serverFingerprint = options.fingerprint ?? "";
   let startedAt = 0;
   const clients = new Set<Client>();
-  const publishers = new Map<string, { client: Client; value: Record<string, unknown>; generation: number }>();
+  const publishers = new Map<string, { client: Client; value: Record<string, unknown>; generation: number; state?: Record<string, unknown> }>();
   let latest: State = { type: "state", publishers: [], updatedAt: Date.now(), initial: true };
   const pending = new Map<Client, Map<string, PendingRequest>>();
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -350,22 +356,46 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
   const cancelIdleExit = () => {
     if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; }
   };
+  // Each published publisher state is an immutable object, so its encodings are shared by every browser and kept only while that state is referenced.
+  const encodedPublishers = new WeakMap<object, string>();
+  const encodedUnfocusedPublishers = new WeakMap<object, string>();
+  const reuse = (cache: WeakMap<object, string>, publisher: unknown, encode: () => string): string => {
+    if (!publisher || typeof publisher !== "object") return encode();
+    let json = cache.get(publisher);
+    if (json === undefined) { json = encode(); cache.set(publisher, json); }
+    return json;
+  };
+  const sharedFrame = (state: State): Buffer => frame(encodeState(state, maxFrameBytes, compactPublisher, (publisher) => reuse(encodedPublishers, publisher, () => JSON.stringify(compactPublisher(publisher)))), maxFrameBytes);
+  // A backpressured browser keeps only the newest state and encodes it on drain, so replaced snapshots are never serialized.
+  // Timing counts as delivered only for the state actually written, encoded with the focus current at that moment.
+  // A hidden browser gets no state; showing it again sends ui:focus, which delivers the latest state.
+  const deliverState = (client: Client, state: State, shared?: () => Buffer): void => {
+    if (client.hidden === true) { client.pendingState = undefined; return; }
+    if (client.backpressured) { client.pendingState = state; return; }
+    if (client.focusAware !== true) { writeFrame(client, shared?.() ?? sharedFrame(state)); return; }
+    const sent = (client.sentTiming ??= new Map<string, number>());
+    const focus = client.focus;
+    const marks: [string, number][] = [];
+    const project = (publisher: unknown): unknown => compactPublisher(focusedPublisher(publisher, focus, sent, (key, revision) => marks.push([key, revision])));
+    // ui:focus replaces sentTiming, so only the focused run ever has delivery marks and other publishers encode the same for every browser.
+    // The focused publisher is reused only after an encoding that shipped no new timing, because then the same state encodes the same until focus changes.
+    const serialize = (publisher: unknown): string => {
+      if (!isFocusedPublisher(publisher, focus)) return reuse(encodedUnfocusedPublishers, publisher, () => JSON.stringify(compactPublisher(focusedPublisher(publisher, undefined))));
+      const cached = client.focusedJson;
+      if (cached !== undefined && cached.publisher === publisher && cached.sentTiming === sent) return cached.json;
+      const before = marks.length;
+      const json = JSON.stringify(project(publisher));
+      if (marks.length === before && publisher && typeof publisher === "object") client.focusedJson = { publisher, sentTiming: sent, json };
+      return json;
+    };
+    const stateFrame = frame(encodeState(state, maxFrameBytes, project, serialize), maxFrameBytes);
+    writeFrame(client, stateFrame, () => { for (const [key, revision] of marks) sent.set(key, revision); });
+  };
   const broadcast = (value: unknown) => {
     if (isState(value)) {
       try {
         let shared: Buffer | undefined;
-        for (const client of clients) {
-          if (client.kind !== "browser") continue;
-          if (client.focusAware !== true) {
-            shared ??= frame(encodeState(value, maxFrameBytes), maxFrameBytes);
-            writeFrame(client, shared, true);
-            continue;
-          }
-          const sent = (client.sentTiming ??= new Map<string, number>());
-          const marks: [string, number][] = [];
-          const stateFrame = frame(encodeState(focusedState(value, client.focus, sent, (key, revision) => marks.push([key, revision])), maxFrameBytes), maxFrameBytes);
-          writeFrame(client, stateFrame, true, () => { for (const [key, revision] of marks) sent.set(key, revision); });
-        }
+        for (const client of clients) if (client.kind === "browser") deliverState(client, value, () => shared ??= sharedFrame(value));
       } catch {
         for (const client of clients) if (client.kind === "browser") client.socket.destroy();
       }
@@ -374,15 +404,15 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     for (const client of clients) if (client.kind === "browser") emit(client, value);
   };
   let viewers = 0;
-  // Publishers poll their run directory, so they only need a fast cadence while a browser is watching.
+  // Publishers poll their run directory, so they only need a fast cadence while a visible browser is watching.
   const notifyViewers = () => {
-    const count = [...clients].filter((candidate) => candidate.kind === "browser").length;
+    const count = [...clients].filter((candidate) => candidate.kind === "browser" && candidate.hidden !== true).length;
     if (count === viewers) return;
     viewers = count;
     for (const candidate of clients) if (candidate.kind === "publisher") emit(candidate, { type: "publisher:viewers", count });
   };
   const publishState = () => {
-    const values = [...publishers.values()].map(({ value, generation }) => ({ ...value, generation }));
+    const values = [...publishers.values()].map((entry) => entry.state ??= { ...entry.value, generation: entry.generation });
     latest = { type: "state", publishers: values, updatedAt: Date.now() };
     broadcast(latest);
   };
@@ -403,19 +433,18 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     const message = value as Record<string, unknown>;
     if (client.superseded) return;
     if (message.type === "publisher:detach" && client.kind === "publisher" && client.publisherId && publishers.get(client.publisherId)?.client === client) { clearPending(client, "Publisher is disconnected"); publishers.delete(client.publisherId); publishState(); scheduleIdleExit(); return; }
-    if (message.type === "ui:attach") { client.kind = "browser"; emit(client, latest); notifyViewers(); return; }
+    if (message.type === "ui:attach") { client.kind = "browser"; client.hidden = message.visible === false; try { deliverState(client, latest); } catch { client.socket.destroy(); } notifyViewers(); return; }
     if (message.type === "ui:focus" && client.kind === "browser") {
       const publisherId = typeof message.publisherId === "string" ? message.publisherId : undefined;
       const runId = typeof message.runId === "string" ? message.runId : undefined;
       client.focusAware = true;
+      // Browsers that predate visibility omit the field and stay visible.
+      client.hidden = message.visible === false;
       client.sentTiming = new Map<string, number>();
       if (publisherId !== undefined && runId !== undefined) client.focus = { publisherId, runId };
       else delete client.focus;
-      const sent = client.sentTiming;
-      const marks: [string, number][] = [];
-      const focused = focusedState(latest, client.focus, sent, (key, revision) => marks.push([key, revision]));
-      try { writeFrame(client, frame(encodeState(focused, maxFrameBytes), maxFrameBytes), true, () => { for (const [key, revision] of marks) sent.set(key, revision); }); }
-      catch { client.socket.destroy(); }
+      try { deliverState(client, latest); } catch { client.socket.destroy(); }
+      notifyViewers();
       return;
     }
     if (client.kind === "publisher" && message.type === "publisher:attach" && typeof message.publisherId === "string") {
@@ -583,14 +612,12 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     if (!authorized(request, port) || url.pathname !== "/ws" || typeof key !== "string") { socket.destroy(); return; }
     const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    const client: Client = { socket, kind: "publisher", buffer: Buffer.alloc(0), pendingState: undefined, pendingDeliver: undefined, backpressured: false, superseded: false };
+    const client: Client = { socket, kind: "publisher", buffer: Buffer.alloc(0), buffered: 0, pendingState: undefined, backpressured: false, superseded: false };
     socket.on("drain", () => {
       const pendingState = client.pendingState;
-      const pendingDeliver = client.pendingDeliver;
       client.pendingState = undefined;
-      client.pendingDeliver = undefined;
       client.backpressured = false;
-      if (pendingState !== undefined) writeFrame(client, pendingState, true, pendingDeliver);
+      if (pendingState !== undefined) { try { deliverState(client, pendingState); } catch { socket.destroy(); } }
     });
     clients.add(client);
     socket.on("data", (chunk: unknown) => {

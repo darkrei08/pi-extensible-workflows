@@ -8,7 +8,7 @@ import { decodeTestJson, decodeTestJsonRecord, decodeTestRunDetails, decodeTestR
 import { Theme, type InlineExtension, type ThemeColor, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static, type TObject, type TOptional, type TString } from "typebox";
 import { WORKFLOW_TOOL_DESCRIPTION, WORKFLOW_TOOL_PARAMETERS, WORKFLOW_TOOL_PROMPT_SNIPPET, navigatorAttentionSort } from "../src/host.js";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, defineWorkflowFunction, formatWorkflowPreview, preflight, registerWorkflowExtension, RunStore, structuralPath, WorkflowError, WorkflowRegistry, type AgentOptions, type PersistedRun, type WorkflowExtension, type WorkflowOrchestrationContext } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, defineWorkflowFunction, formatWorkflowPreview, preflight, registerWorkflowExtension, RunStore, structuralPath, WorkflowError, WorkflowRegistry, type AgentOptions, type PersistedRun, type WorkflowExtension, type WorkflowFunctionContext, type WorkflowOrchestrationContext, type JsonValue } from "../src/index.js";
 import { loadingRegistry } from "../src/registry.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
@@ -122,6 +122,24 @@ const typeCheckWorktreeContext = (context: WorkflowOrchestrationContext): void =
   void context.withWorktree(() => "value");
 };
 void typeCheckWorktreeContext;
+const typeCheckFunctionTools = (context: WorkflowFunctionContext): void => {
+  const tools: Record<string, (args: Record<string, JsonValue>) => Promise<JsonValue>> = context.tools;
+  void tools;
+  const call = context.tools.retail_find;
+  assert.ok(call);
+  const result: Promise<JsonValue> = call({ query: "item", nested: { count: 1 }, values: [null, true] });
+  void result;
+  // @ts-expect-error session tools take one arguments object
+  void call("item");
+  // @ts-expect-error session tool arguments must be JSON-compatible
+  void call({ query: () => "item" });
+  // @ts-expect-error session tools require their arguments object
+  void call();
+  // @ts-expect-error session tools return JSON, not a statically known result shape
+  const knownResult: Promise<{ found: boolean }> = call({});
+  void knownResult;
+};
+void typeCheckFunctionTools;
 
 void test("accepts but ignores legacy top-level extension descriptions", () => {
   const registry = new WorkflowRegistry();
@@ -234,7 +252,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
   };
   workflowExtension(testExtensionApi(pi));
   assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_stop", "workflow_status", "workflow_retry", "workflow_resume", "workflow"]);
-  assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
+  assert.deepEqual(commands.map(({ name }) => name), ["workflow", "agents"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   assert.equal(tool.promptGuidelines, undefined);
@@ -279,6 +297,48 @@ void test("workflow launches from a script file and snapshots its exact source",
   assert.equal(loaded.snapshot.script, script);
   assert.deepEqual(loaded.snapshot.args, { value: "from-file" });
   assert.equal(readFileSync(join(store.directory, "workflow.js"), "utf8"), script);
+});
+void test("a workflow longer than any platform's command line launches with its exact source and args", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-large-launch-"));
+  // NOTE: over 1 MiB each, past Windows' 32,767-character command line, Linux's 128 KiB argument and macOS's 1 MiB argument space.
+  // Quotes, backslashes and newlines grow the most when quoted for a command line; the emoji checks the UTF-8 round trip.
+  const text = "say \"héllo\" \\ \u{1F642}\n".repeat(65_536);
+  const script = `export const meta={name:'large-launch'}; return args.text === ${JSON.stringify(text)} ? args.text.length : 'mismatch';`;
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = decodeTestToolResult(await workflow.execute("large", { name: "large-launch", script, args: { text }, foreground: true }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } }));
+  assert.equal(result.content[0]?.text, String(text.length));
+  const loaded = await new RunStore(home, "session", decodeTestRunDetails(result.details).runId, home).load();
+  assert.equal(loaded.run.state, "completed");
+});
+void test("a run whose worker cannot be started is persisted as failed, not left running", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worker-start-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  // The worker's temporary directory cannot be created under a regular file.
+  const tmpdirVariable = process.platform === "win32" ? "TEMP" : "TMPDIR";
+  const originalTmpdir = process.env[tmpdirVariable];
+  const notADirectory = join(home, "not-a-directory");
+  writeFileSync(notADirectory, "");
+  process.env[tmpdirVariable] = notADirectory;
+  try {
+    await assert.rejects(workflow.execute("unstartable", { name: "unstartable", script: "return 1;", foreground: true }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR");
+  } finally {
+    if (originalTmpdir === undefined) {
+      if (tmpdirVariable === "TEMP") delete process.env.TEMP;
+      else delete process.env.TMPDIR;
+    } else process.env[tmpdirVariable] = originalTmpdir;
+  }
+  const runIds = await listRunIds(home, "session", home);
+  assert.equal(runIds.length, 1);
+  const loaded = await new RunStore(home, "session", runIds[0] ?? "", home).load();
+  assert.equal(loaded.run.state, "failed");
+  assert.equal(loaded.run.error?.code, "INTERNAL_ERROR");
+  assert.match(loaded.run.error.message, /not-a-directory/);
 });
 void test("workflow_retry links children, replays parallel branches, inherits budgets, and supports retry chains", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-tool-"));
@@ -470,6 +530,46 @@ void test("workflow_retry rejects concurrent children for one mutable retry line
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for the retry child to complete");
+});
+void test("workflow_retry accepts a retry issued as soon as the previous retry child reads failed", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-released-"));
+  let sessions = 0;
+  const createSession = async (): Promise<TestPiSession> => {
+    const attempt = ++sessions;
+    return { sessionId: `retry-released-${String(attempt)}`, sessionFile: `/sessions/retry-released-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { if (attempt <= 2) throw new Error("failure"); }, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(workflow && retry);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(workflow.execute("source", { name: "released-source", script: `return agent("work");`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const sourceId = (await listRunIds(home, "session", home))[0];
+  assert.ok(sourceId);
+  // The child's failure record is held after its state already reads failed, so the retry below lands in that window.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reached!: (runId: string) => void;
+  const failedChild = new Promise<string>((resolve) => { reached = resolve; });
+  const updateState = Object.getOwnPropertyDescriptor(RunStore.prototype, "updateState")?.value as RunStore["updateState"];
+  RunStore.prototype.updateState = function (this: RunStore, update) {
+    return updateState.call(this, async (current) => {
+      const next = await update(current);
+      if (this.cwd === home && this.runId !== sourceId && next.error !== undefined && current.error === undefined) { reached(this.runId); await gate; }
+      return next;
+    });
+  };
+  try {
+    await retry.execute("retry", { runId: sourceId, foreground: false }, undefined, undefined, context);
+    const childId = await failedChild;
+    assert.equal((await new RunStore(home, "session", childId, home).load()).run.state, "failed");
+    const again = decodeTestToolResult(await retry.execute("retry-again", { runId: childId, foreground: false }, undefined, undefined, context));
+    assert.equal(decodeTestRunStart(again.content[0]?.text ?? "null").parentRunId, childId);
+  } finally {
+    release();
+    RunStore.prototype.updateState = updateState;
+  }
 });
 void test("workflow_retry cleans up child startup when dynamic alias resolution fails", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-alias-failure-"));

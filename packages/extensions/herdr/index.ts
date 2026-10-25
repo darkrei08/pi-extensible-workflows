@@ -439,8 +439,9 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
         return next;
       };
       let opened;
+      const turnControlDelivered = prepared.turnControl !== undefined && prepared.initialPrompt !== undefined;
       try {
-        opened = await beginLaunch(prepared.initialPrompt);
+        opened = await beginLaunch(turnControlDelivered ? `${prepared.initialPrompt}\n\n${prepared.turnControl}` : prepared.initialPrompt);
       } catch (error) {
         await session.dispose().catch(() => undefined);
         throw error;
@@ -451,6 +452,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
         ...session,
         getLastAssistant(this: HerdrSession): WorkflowAgentMessage | undefined { return session.getLastAssistant?.call(this); },
         reference: { ...session.reference, transport: "herdr" },
+        turnControlDelivered,
         async prompt(text) {
           if (disposed) throw new Error("Herdr workflow session is disposed");
           let current = active;

@@ -33,18 +33,23 @@ function registerStarter() {
 
 function reviewContext(
   reviews: readonly { pass: boolean; findings: string[] }[],
-): { context: WorkflowFunctionContext; roles: string[] } {
+): { context: WorkflowFunctionContext; roles: string[]; handles: { name: unknown; label: unknown; role: unknown; sends: string[] }[]; reviewers: { label: unknown; prompt: string }[] } {
   let reviewIndex = 0;
   const roles: string[] = [];
-  const context = {
-    agent: async (_prompt: string, options?: Readonly<{ role?: string }>) => {
-      const role = options?.role ?? "developer";
-      roles.push(role);
-      return role === "reviewer" ? reviews[reviewIndex++] ?? reviews.at(-1) : "implemented";
-    },
-    prompt: (template: string) => template,
-  } as unknown as WorkflowFunctionContext;
-  return { context, roles };
+  const handles: { name: unknown; label: unknown; role: unknown; sends: string[] }[] = [];
+  const reviewers: { label: unknown; prompt: string }[] = [];
+  const agent = async (prompt: string, options?: Readonly<{ role?: string; label?: string }>) => {
+    roles.push(options?.role ?? "none");
+    reviewers.push({ label: options?.label, prompt });
+    return reviews[reviewIndex++] ?? reviews.at(-1);
+  };
+  const create = (options: Readonly<{ name: string; label?: string; role?: string }>) => {
+    const handle = { name: options.name, label: options.label, role: options.role, sends: [] as string[] };
+    handles.push(handle);
+    return { name: options.name, send: async (prompt: string) => { roles.push(options.role ?? "none"); handle.sends.push(prompt); return "implemented"; } };
+  };
+  const context = { agent: Object.assign(agent, { create }), prompt: (template: string, values: Readonly<Record<string, unknown>>) => template.replace(/\{(\w+)\}/g, (_match, key: string) => JSON.stringify(values[key])) } as unknown as WorkflowFunctionContext;
+  return { context, roles, handles, reviewers };
 }
 void test("records and validates portable workflow source metadata", () => {
   const workflow = { description: "Portable", input: { type: "object" }, output: { type: "boolean" }, run: () => true };
@@ -67,6 +72,26 @@ void test("reviewLoop passes after a reviewer approves", async () => {
   assert.equal(result.pass, true);
   assert.equal(result.iterations, 2);
   assert.deepEqual(roles, ["developer", "reviewer", "developer", "reviewer"]);
+});
+
+void test("reviewLoop creates one developer handle and a fresh labelled reviewer per iteration", async () => {
+  const { context, handles, reviewers } = reviewContext([
+    { pass: false, findings: ["Fix the issue"] },
+    { pass: true, findings: [] },
+  ]);
+
+  await reviewLoop.run({ task: "Implement the change", maxIterations: 3 }, context);
+
+  assert.equal(handles.length, 1);
+  const [developer] = handles;
+  assert.ok(developer);
+  assert.deepEqual([developer.name, developer.label, developer.role], ["developer", "Developer", "developer"]);
+  assert.equal(developer.sends.length, 2);
+  assert.match(developer.sends[0] ?? "", /Implement the change/);
+  assert.match(developer.sends[1] ?? "", /Fix the issue/);
+  assert.doesNotMatch(developer.sends[1] ?? "", /Implement the change/);
+  assert.deepEqual(reviewers.map(({ label }) => label), ["Reviewer 1", "Reviewer 2"]);
+  for (const { prompt } of reviewers) assert.match(prompt, /actual current implementation against the entire original task/);
 });
 
 void test("reviewLoop fails when the iteration limit is reached", async () => {

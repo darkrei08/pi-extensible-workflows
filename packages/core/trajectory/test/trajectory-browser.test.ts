@@ -33,7 +33,7 @@ function findBrowser(): string | undefined {
   try {
     for (const version of readdirSync(join(homedir(), ".cache", "ms-playwright"))) candidates.push(join(homedir(), ".cache", "ms-playwright", version, "chrome-linux64", "chrome"));
   } catch { /* The browser cache is optional. */ }
-  for (const name of ["chromium", "google-chrome", "chromium-browser"]) {
+  for (const name of ["google-chrome", "chromium", "chromium-browser"]) {
     try { candidates.push(execFileSync("which", [name], { encoding: "utf8" }).trim()); } catch { /* Try the next browser location. */ }
   }
   const found = candidates.find((candidate) => typeof candidate === "string" && Boolean(candidate) && existsSync(candidate));
@@ -181,8 +181,8 @@ async function withChrome(url: string, signal: AbortSignal, callback: (page: Dev
   }
 }
 
-function makeState(output: Record<string, unknown>, state: "running" | "completed"): Record<string, unknown> {
-  const agent = { id: "agent", name: "fixture-agent", label: "fixture-agent", state, attempts: 1, startedAt: 1, durationMs: state === "completed" ? 10 : undefined, model: { provider: "fixture", model: "model" }, requestedModel: "fixture/request", tools: ["read"], skills: ["review"], extensions: ["fixture"], prompt: "Inspect the fixture", systemPrompt: "System prompt", output, attemptDetails: [{ attempt: 1, transport: "local", setup: { cwd: "/project", model: { provider: "fixture", model: "model" }, tools: ["read"] } }] };
+function makeState(output: Record<string, unknown>, state: "running" | "completed", systemPrompt = "System prompt"): Record<string, unknown> {
+  const agent = { id: "agent", name: "fixture-agent", label: "fixture-agent", state, attempts: 1, startedAt: 1, durationMs: state === "completed" ? 10 : undefined, model: { provider: "fixture", model: "model" }, requestedModel: "fixture/request", tools: ["read"], skills: ["review"], extensions: ["fixture"], prompt: "Inspect the fixture", systemPrompt, output, attemptDetails: [{ attempt: 1, transport: "local", setup: { cwd: "/project", model: { provider: "fixture", model: "model" }, tools: ["read"] } }] };
   const run = { id: "run", workflowName: "fixture", cwd: "/project", sessionId: "session", state, agents: [agent], transcripts: { agent: [{ type: "message", timestamp: "2025-01-01T00:00:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "transcript" }] } }] }, snapshot: { script: "return true;" } };
   return { type: "state", publishers: [{ id: "publisher", title: "fixture", cwd: "/project", sessionId: "session", connected: true, runs: [{ run }], subagents: [] }], updatedAt: 1 };
 }
@@ -220,6 +220,32 @@ void test("Trajectory static export opens Agent details and its Output tab in Ch
       });
     } finally { await server.close(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+void test("Trajectory Chromium prompt panes display full system prompts as safe plain text", { skip: !browserPath, timeout: 120_000 }, async (t) => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const prompt = ['Introduction & "quoted"', ...["tools", "rules", "docs", "addendum", "project_context", "skills", "cwd"].map((tag) => `<${tag}>\n${tag === "addendum" ? "# Developer Role\n\nFollow developer instructions." : `Contents of ${tag}`}\n</${tag}>`), '<script>window.__promptExecuted = true</script>\n<img src=x onerror="window.__promptExecuted = true">'].join("\n");
+  const fixture = JSON.stringify(makeState({ status: "pending" }, "running", prompt)).replace(/</g, "\\u003c");
+  const html = source.replace("  <script>\n    const defaultRunLayout", `  <script>window.__PIEWF_STATIC__ = ${fixture};</script>\n  <script>\n    const defaultRunLayout`);
+  assert.notEqual(html, source);
+  const server = await serve(new Map<string, RouteBody>([["/index.html", html], ["/marked.min.js", readFileSync(new URL("../src/assets/marked.min.js", import.meta.url))], ["/morphdom.min.js", readFileSync(new URL("../src/assets/morphdom.min.js", import.meta.url))]]));
+  try {
+    await withChrome(`${server.url}/index.html`, t.signal, async (page) => {
+      await waitFor(page, "Boolean(document.querySelector('.agent-grid-row'))");
+      await page.evaluate(clickExpression(".agent-grid-row"));
+      const assertPrompt = async (): Promise<void> => {
+        assert.equal(await page.evaluate("document.querySelector('#sys-pane .code').textContent"), prompt);
+        assert.equal(await page.evaluate("getComputedStyle(document.querySelector('#sys-pane .code')).whiteSpace"), "pre-wrap");
+        assert.equal(await page.evaluate("document.querySelectorAll('#sys-pane script, #sys-pane img, #sys-pane addendum').length"), 0);
+        assert.equal(await page.evaluate("Boolean(window.__promptExecuted)"), false);
+      };
+      await page.evaluate(clickExpression('[data-event="0"]'));
+      await assertPrompt();
+      await page.evaluate(clickExpression("[data-agent-details]"));
+      assert.equal(await page.evaluate("document.querySelector('#sys-tabs [data-pane=prompt]').classList.contains('on')"), true);
+      await assertPrompt();
+    });
+  } finally { await server.close(); }
 });
 
 void test("Trajectory Chromium view preserves the selected Output tab across live publisher updates", { skip: !browserPath, timeout: 120_000 }, async (t) => {
@@ -307,6 +333,34 @@ void test("Trajectory live gantt keeps cached timing, merges dense calls, and pa
     await new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+void test("Trajectory running gantt rescales every bar from its clock alone when the timeline grows", { skip: !browserPath, timeout: 120_000 }, async (t) => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  // The page clock is controlled and the socket emits one state, so only the browser's own clock can rescale the gantt.
+  const start = 1_700_000_000_000;
+  const bootstrap = `<script>(function(){window.__now=${String(start + 100_000)};Date.now=()=>window.__now;class FakeSocket{constructor(){this.readyState=1;this.listeners={};window.__trajectorySocket=this;}addEventListener(type,listener){(this.listeners[type] ||= []).push(listener);}send(){}close(){}emit(type,data){for(const listener of this.listeners[type] || []) listener({data});}}window.WebSocket=FakeSocket;})();</script>`;
+  const html = source.replace("  <script>\n    const defaultRunLayout", `  ${bootstrap}\n  <script>\n    const defaultRunLayout`);
+  assert.notEqual(html, source);
+  const server = await serve(new Map<string, RouteBody>([["/index.html", html], ["/marked.min.js", readFileSync(new URL("../src/assets/marked.min.js", import.meta.url))], ["/morphdom.min.js", readFileSync(new URL("../src/assets/morphdom.min.js", import.meta.url))]]));
+  const agent = (id: string, startedAt: number, durationMs?: number) => ({ id, name: id, label: id, path: id, state: durationMs === undefined ? "running" : "completed", attempts: 1, startedAt, durationMs, model: { provider: "fixture", model: "model" }, tools: ["read"] });
+  const run = { id: "run", workflowName: "clock", cwd: "/project", sessionId: "session", state: "running", createdAt: new Date(start).toISOString(), usage: { durationMs: 0 }, agents: [agent("done", start, 50_000), agent("busy", start + 50_000)], agentSessions: [], events: [] };
+  const frame = JSON.stringify({ type: "state", publishers: [{ id: "publisher", title: "clock", cwd: "/project", sessionId: "session", connected: true, runs: [{ run, snapshot: { script: "return true;" }, transcripts: { done: [toolTiming("read-1", start + 25_000, 10_000)] } }], subagents: [] }], updatedAt: 1 });
+  // Every bar must sit where a fresh render at the page clock would put it.
+  const geometry = `(() => { const span = quantizeSpan(Date.now() - ${String(start)}); const lane = (id, selector) => document.querySelector('#swim-content .lane[data-agent="' + id + '"] ' + selector)?.style; const near = (value, expected) => Math.abs(parseFloat(value) - expected) < 0.001; return near(lane('done', '.bar:not(.tool)')?.width, 50000 / span * 100) && near(lane('done', '.bar.tool')?.left, 25000 / span * 100) && near(lane('done', '.bar.tool')?.width, 10000 / span * 100) && near(lane('busy', '.bar:not(.tool)')?.left, 50000 / span * 100) && near(lane('busy', '.bar:not(.tool)')?.width, (Date.now() - ${String(start + 50_000)}) / span * 100) && Number(document.getElementById('swim').dataset.timelineSpan) === span && document.querySelector('[data-clock-axis="mid"]')?.textContent === '+' + fmtRuntime(span / 2) && document.getElementById('run-stats').textContent.endsWith('runtime ' + fmtRuntime(Date.now() - ${String(start)})); })()`;
+  try {
+    await withChrome(`${server.url}/index.html?view=run&run=publisher:run`, t.signal, async (page) => {
+      await waitFor(page, "Boolean(window.__trajectorySocket)");
+      await page.evaluate(`window.__trajectorySocket.emit('message', ${JSON.stringify(frame)})`);
+      await waitFor(page, geometry);
+      const before = Number(await page.evaluate("document.getElementById('swim').dataset.timelineSpan"));
+      await page.evaluate(`window.__now = ${String(start + 300_000)}`);
+      await waitFor(page, `Number(document.getElementById('swim').dataset.timelineSpan) > ${String(before)}`);
+      await waitFor(page, geometry);
+      assert.equal(await page.evaluate("document.querySelectorAll('#swim-content .lane[data-agent]').length"), 2);
+      assert.equal(await page.evaluate("document.querySelector('.run-item.on')?.dataset.run"), "publisher:run");
+    });
+  } finally { await server.close(); }
 });
 
 void test("Trajectory keeps a subagent transcript when a refresh races a newer revision", { skip: !browserPath, timeout: 120_000 }, async (t) => {
@@ -1569,5 +1623,122 @@ void test("Trajectory Semantic Map tab upgrade across real server builds fails v
     await stopOwnedServer(owned);
     rmSync(rootA, { recursive: true, force: true });
     rmSync(rootB, { recursive: true, force: true });
+  }
+});
+// Records every state frame by run name on every socket the page opens, including reconnects; a hidden page starts hidden.
+function frameRecorder(hidden: boolean): string {
+  return `(() => { ${hidden ? "Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });" : ""} window.__frames = []; window.__sockets = 0; const Native = window.WebSocket; window.WebSocket = class extends Native { constructor(...args) { super(...args); window.__sockets += 1; this.addEventListener('message', (event) => { const message = JSON.parse(event.data); if (message.type === 'state') window.__frames.push(message.publishers.map((publisher) => publisher.runs?.[0]?.run?.workflowName ?? '').join(',')); }); } }; })()`;
+}
+function setHiddenExpression(hidden: boolean): string {
+  return `Object.defineProperty(document, 'hidden', { configurable: true, get: () => ${String(hidden)} }); document.dispatchEvent(new Event('visibilitychange'))`;
+}
+async function waitNode(condition: () => boolean, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (condition()) return;
+    await delay(25);
+  }
+  throw new Error(`Condition did not become true: ${label}`);
+}
+
+void test("Trajectory Chromium tabs get no state while hidden and resume with the latest state and selection", { skip: !browserPath, timeout: 120_000 }, async (t) => {
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });
+  const address = probe.address();
+  assert.ok(address && typeof address !== "string");
+  const port = address.port;
+  await new Promise<void>((resolve) => { probe.close(() => { resolve(); }); });
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-hidden-"));
+  const server = createTrajectoryServer(port, join(root, "lock.json"));
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); });
+  const start = Date.now() - 600_000;
+  const publisherId = "hiddenpublisher1";
+  const publisher = new WebSocket(`ws://127.0.0.1:${String(port)}/ws`);
+  const viewers: number[] = [];
+  publisher.addEventListener("message", (event) => { const message = JSON.parse(String(event.data)) as { type?: string; count?: number }; if (message.type === "publisher:viewers" && typeof message.count === "number") viewers.push(message.count); });
+  await new Promise((resolve) => { publisher.addEventListener("open", resolve, { once: true }); });
+  publisher.send(JSON.stringify({ type: "publisher:attach", publisherId }));
+  // Each update renames the run and adds one tool call, so a page shows which update it rendered.
+  const publish = (step: number) => {
+    const timing = Array.from({ length: step }, (_, index) => toolTiming(`call-${String(index)}`, start + 60_000 + index * 60_000, 4_000));
+    const run = { id: "live", workflowName: `live-${String(step)}`, cwd: "/project", sessionId: "session", state: "running", agents: [{ id: "busy", name: "busy", label: "busy", path: "busy", state: "running", attempts: 1, startedAt: start, model: { provider: "fixture", model: "model" }, tools: ["read"] }], agentSessions: [], events: [] };
+    publisher.send(JSON.stringify({ type: "publisher:state", publisher: { id: publisherId, title: "hidden", cwd: "/project", sessionId: "session", connected: true }, runs: [{ run, snapshot: { script: "return true;" }, transcripts: { busy: { revision: step, status: "available", timing } } }], subagents: [] }));
+  };
+  const lastViewers = () => viewers.at(-1);
+  const url = `http://127.0.0.1:${String(port)}/?view=run&run=${publisherId}:live`;
+  const open = async (page: Devtools, hidden: boolean): Promise<void> => {
+    await page.command("Page.enable");
+    await page.command("Page.addScriptToEvaluateOnNewDocument", { source: frameRecorder(hidden) });
+    await page.command("Page.navigate", { url });
+    await waitFor(page, "document.readyState === 'complete' && window.__sockets === 1");
+  };
+  const shows = (step: number) => `document.getElementById('canvas-run').textContent === 'live-${String(step)}'`;
+  const frames = async (page: Devtools): Promise<string[]> => await page.evaluate("window.__frames") as string[];
+  // A forced focus is answered with one more state on the same socket, so every earlier frame has arrived once it lands.
+  const settledFrames = async (page: Devtools): Promise<string[]> => {
+    const count = (await frames(page)).length;
+    await page.evaluate("sendFocus(true)");
+    await waitFor(page, `window.__frames.length > ${String(count)}`);
+    return (await frames(page)).slice(0, -1);
+  };
+  const selection = async (page: Devtools): Promise<unknown> => page.evaluate(`[document.querySelector('.run-item.on')?.dataset.run, new URLSearchParams(location.search).get('view'), document.querySelectorAll('#swim-content .lane[data-agent="busy"] .bar.tool').length]`);
+  try {
+    publish(1);
+    await withChrome("about:blank", t.signal, async (first) => {
+      await open(first, false);
+      await waitFor(first, shows(1));
+      await withChrome("about:blank", t.signal, async (second) => {
+        await open(second, false);
+        await waitFor(second, shows(1));
+        await waitNode(() => lastViewers() === 2, "two visible viewers");
+
+        await second.evaluate(setHiddenExpression(true));
+        await waitNode(() => lastViewers() === 1, "one visible viewer");
+        const secondBefore = (await frames(second)).length;
+        publish(2);
+        await waitFor(first, shows(2));
+        await first.evaluate(setHiddenExpression(true));
+        await waitNode(() => lastViewers() === 0, "no visible viewer");
+        publish(3);
+
+        await second.evaluate(setHiddenExpression(false));
+        await waitFor(second, shows(3));
+        assert.deepEqual((await settledFrames(second)).slice(secondBefore), ["live-3"], "a hidden tab receives only the state that resumes it");
+        assert.deepEqual(await selection(second), [`${publisherId}:live`, "run", 3]);
+        await waitNode(() => lastViewers() === 1, "the resumed viewer");
+
+        // A hidden tab that reconnects stays hidden and still resumes with the newest state.
+        await second.evaluate(setHiddenExpression(true));
+        await waitNode(() => lastViewers() === 0, "no visible viewer after hiding again");
+        const beforeReconnect = (await frames(second)).length;
+        await second.evaluate("state.socket.close()");
+        await waitFor(second, "window.__sockets === 2 && state.socket?.readyState === 1");
+        publish(4);
+        await second.evaluate(setHiddenExpression(false));
+        await waitFor(second, shows(4));
+        assert.deepEqual((await settledFrames(second)).slice(beforeReconnect), ["live-4"]);
+        assert.deepEqual(await selection(second), [`${publisherId}:live`, "run", 4]);
+
+        // A tab that attaches hidden is not a viewer and gets its first state when shown.
+        await withChrome("about:blank", t.signal, async (third) => {
+          await open(third, true);
+          await waitFor(third, "state.socket?.readyState === 1");
+          publish(5);
+          await waitFor(second, shows(5));
+          await third.evaluate(setHiddenExpression(false));
+          await waitFor(third, shows(5));
+          assert.deepEqual(await settledFrames(third), ["live-5"]);
+          assert.deepEqual(await selection(third), [`${publisherId}:live`, "run", 5]);
+        });
+
+        await first.evaluate(setHiddenExpression(false));
+        await waitFor(first, shows(5));
+        assert.deepEqual(await selection(first), [`${publisherId}:live`, "run", 5]);
+        assert.ok(!viewers.some((count) => count > 2), `hidden tabs never counted as viewers: ${viewers.join(",")}`);
+      });
+    });
+  } finally {
+    publisher.close();
+    await new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
+    rmSync(root, { recursive: true, force: true });
   }
 });
