@@ -475,15 +475,16 @@ class CliProgress {
     const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame++ % 10] ?? "◇";
     const width = process.stderr.columns || 80;
     const rows = Math.max(1, process.stderr.rows || 24);
+    const visibleRows = Math.max(1, rows - 1);
     const lines = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles), width);
     const resized = this.#rows !== 0 && this.#rows !== rows;
-    const visibleLimit = resized ? Math.min(this.#lines, rows) : rows;
+    const visibleLimit = resized ? Math.min(this.#lines, visibleRows) : visibleRows;
     const visibleLines = Math.min(lines.length, Math.max(1, visibleLimit));
     if (!this.#previousLines.length) {
       this.stderr(`\x1b[?25l\x1b[0J${lines.join("\n")}\n`);
     } else if (lines.length < this.#previousLines.length) {
       const text = lines.slice(-visibleLines).join("\n");
-      this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, rows))}A` : ""}\x1b[0J${text}\n`);
+      this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, visibleRows))}A` : ""}\x1b[0J${text}\n`);
     } else {
       const appended = lines.length > this.#previousLines.length;
       const changed = lines.slice(0, this.#previousLines.length).reduce<number[]>((indices, line, index) => {
@@ -507,7 +508,7 @@ class CliProgress {
   }
   finish(): void {
     if (this.#timer) { clearInterval(this.#timer); this.#timer = undefined; }
-    if (this.#interactive && this.#lines) { this.stderr(`\x1b[${String(Math.min(this.#lines, process.stderr.rows || this.#rows || 24))}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
+    if (this.#interactive && this.#lines) { this.stderr("\x1b[?25h"); this.#lines = 0; }
     this.#run = undefined;
   }
 }

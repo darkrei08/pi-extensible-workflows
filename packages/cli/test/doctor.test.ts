@@ -493,6 +493,45 @@ void test("CLI TTY progress repaints and respects terminal width", async () => {
   assert.ok(stderr.includes("\u001b[1A"));
   assert.match(stderr, /…/);
 });
+function emulateTerminal(output: string, rows: number): { history: string[]; screen: string[] } {
+  const history: string[] = [];
+  const screen = Array.from({ length: rows }, () => "");
+  let row = 0;
+  let column = 0;
+  const scroll = () => { history.push(screen.shift() ?? ""); screen.push(""); row = rows - 1; };
+  const eraseDisplay = () => { screen[row] = screen[row]?.slice(0, column) ?? ""; for (let index = row + 1; index < rows; index += 1) screen[index] = ""; };
+  const csi = new RegExp(`${String.fromCharCode(27)}\\[([0-9;?]*)([A-Za-z])`, "y");
+  for (let index = 0; index < output.length;) {
+    csi.lastIndex = index;
+    const control = csi.exec(output);
+    if (control) {
+      const parameters = control[1] ?? "";
+      const command = control[2] ?? "";
+      const amount = Number(parameters.replace("?", "").split(";")[0] || 1);
+      if (command === "A") row = Math.max(0, row - amount);
+      else if (command === "B") row = Math.min(rows - 1, row + amount);
+      else if (command === "J" && parameters === "0") eraseDisplay();
+      else if (command === "K" && parameters === "2") { screen[row] = ""; column = 0; }
+      index = csi.lastIndex;
+    } else if (output[index] === "\r") {
+      column = 0;
+      index += 1;
+    } else if (output[index] === "\n") {
+      column = 0;
+      if (row === rows - 1) scroll(); else row += 1;
+      index += 1;
+    } else if (output[index] === "\x1b") {
+      index += 1;
+    } else {
+      const character = output[index] ?? "";
+      screen[row] = `${screen[row]?.slice(0, column) ?? ""}${character}${screen[row]?.slice(column + 1) ?? ""}`;
+      column += 1;
+      index += character.length;
+    }
+  }
+  return { history, screen };
+}
+
 void test("CLI TTY progress keeps an oversized block inside the terminal viewport", async () => {
   registerWorkflowExtension({
     version: "1.0.0",
@@ -519,9 +558,11 @@ void test("CLI TTY progress keeps an oversized block inside the terminal viewpor
   } finally {
     Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows });
   }
-  const cursorMoves = [...stderr.matchAll(new RegExp(`${String.fromCharCode(27)}\\[(\\d+)A`, "g"))].map((match) => Number(match[1]));
-  assert.match(stderr, /phase-9/);
-  assert.ok(cursorMoves.every((lines) => lines <= 5), stderr);
+  const terminal = emulateTerminal(stderr, 5);
+  const finalOutput = [...terminal.history, ...terminal.screen];
+  assert.equal(finalOutput.filter((line) => line.includes("Workflow: cliTallProgress")).length, 1, finalOutput.join("\n"));
+  for (let index = 0; index < 10; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`[Phase: phase-${String(index)}]`)).length, 1, finalOutput.join("\n"));
+  assert.ok(terminal.screen.some((line) => line.includes("[Phase: phase-9]")), terminal.screen.join("\n"));
 });
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();
