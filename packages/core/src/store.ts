@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
@@ -14,7 +14,8 @@ import {
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference, type EvidenceRecord,
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
-import { runsDirectory, safePart, structuralPath } from "./paths.js";
+import { canonicalPath, piResourceContains, runsDirectory, safePart, sameFilesystemPath, structuralPath } from "./paths.js";
+import { copyWorktreeIncludes, filterDirtyTreeStatus, worktreeIncludePlan } from "./worktreeinclude.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
@@ -55,14 +56,16 @@ export class RunStore {
   private borrowedWorktreeLane = new SerialLane();
   private snapshotLane = new SerialLane();
   private launchSnapshotLane = new SerialLane();
+  private copyWorktreeIncludes = true;
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
   private systemPromptLane = new SerialLane();
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir()) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
   }
+  disableWorktreeIncludes(): void { this.copyWorktreeIncludes = false; }
   #assertRunIdentity(run: PersistedRun, code: WorkflowErrorCode, message: string): void {
-    if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
+    if (!sameFilesystemPath(run.cwd, this.cwd) || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
   }
 
   async create(run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): Promise<void> {
@@ -651,7 +654,7 @@ export class RunStore {
     }
   }
 
-  async worktree(owner: string): Promise<WorktreeReference> {
+  async worktree(owner: string, options: Readonly<{ copyIncludes?: boolean }> = {}): Promise<WorktreeReference> {
     const write = this.worktreeLane.run(async () => {
       const loaded = await this.load();
       const recordsPath = resolve(this.directory, "worktrees.json");
@@ -676,17 +679,20 @@ export class RunStore {
       let markerWritten = false;
       try {
         const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
-        const [canonicalRoot, canonicalCwd] = await Promise.all([realpath(root), realpath(this.cwd)]);
+        const canonicalRoot = canonicalPath(root);
+        const canonicalCwd = canonicalPath(this.cwd);
+        if (!piResourceContains(canonicalRoot, canonicalCwd)) throw new Error("launch cwd is outside the repository");
         const launchRelative = relative(canonicalRoot, canonicalCwd);
-        if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
         await this.cleanupMarker(markerPath);
-        const dirty = (await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
-        if (dirty) {
-          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.slice(3));
+        const dirtyOutput = await git(root, ["status", "--porcelain", "-z", "--untracked-files=normal"]);
+        const dirtyPaths = filterDirtyTreeStatus(dirtyOutput);
+        if (dirtyPaths.length > 0) {
           const shownPaths = dirtyPaths.slice(0, 10);
           const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
           throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
         }
+        const copyIncludes = options.copyIncludes !== false && this.copyWorktreeIncludes && loaded.run.retry === undefined;
+        const includePlan = copyIncludes ? await worktreeIncludePlan(root) : [];
         let commit: string;
         try {
           commit = (await git(root, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
@@ -702,6 +708,7 @@ export class RunStore {
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
+        if (copyIncludes) await copyWorktreeIncludes(root, path, includePlan);
         await atomicJson(recordsPath, [...records, record]);
         await rm(markerPath, { force: true });
         return record;

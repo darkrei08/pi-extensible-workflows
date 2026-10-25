@@ -879,7 +879,7 @@ class PersistentSubagentManager implements SubagentManager {
     return run.terminal;
   }
 
-  private async start(snapshot: SubagentRunRequest, context: Readonly<SubagentManagerContext>, frozenExternal?: StandaloneExternalConfiguration): Promise<LiveRun> {
+  private async start(snapshot: SubagentRunRequest, context: Readonly<SubagentManagerContext>, frozenExternal?: StandaloneExternalConfiguration, skipWorktreeIncludes = false): Promise<LiveRun> {
     await this.ensureInitialized();
     if (this.disposed) throw new WorkflowError("CANCELLED", "Subagent manager is disposed");
     if (context.signal?.aborted) throw new WorkflowError("CANCELLED", "Subagent cancelled");
@@ -927,6 +927,7 @@ class PersistentSubagentManager implements SubagentManager {
         runId: id,
         name: snapshot.worktree,
         owner: structuralPath("worktree", "named", snapshot.worktree),
+        ...((skipWorktreeIncludes || !context.extensionContext.isProjectTrusted()) ? { copyIncludes: false } : {}),
       };
       if (worktreeContext !== undefined) {
         live.worktreeContext = worktreeContext;
@@ -1146,7 +1147,7 @@ class PersistentSubagentManager implements SubagentManager {
       if (!root.agentPreparationHooks?.length && root.availableModels?.has(modelCapability(model)) === false) throw new WorkflowError("UNKNOWN_MODEL", `Required model is unavailable: ${modelCapability(model)}`);
     }
     const retryRequest = context.waitForForeground === false && requestSnapshot.mode === "foreground" ? { ...requestSnapshot, mode: "background" as const } : requestSnapshot;
-    const run = await this.start(retryRequest, context, edits?.model === undefined ? frozenExternal : undefined);
+    const run = await this.start(retryRequest, context, edits?.model === undefined ? frozenExternal : undefined, true);
     emitUpdate(run);
     if (run.request.mode !== "foreground") return { id: run.id, state: "running" };
     return run.terminal;

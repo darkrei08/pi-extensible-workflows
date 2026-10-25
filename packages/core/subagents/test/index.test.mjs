@@ -1909,6 +1909,95 @@ test("standalone worktree preparation sees the launch project root and dynamic a
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("copies selected ignored context into a standalone subagent worktree", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-worktreeinclude-"));
+  await writeFile(join(cwd, "README.md"), "base\n");
+  await writeFile(join(cwd, ".gitignore"), "storage/\nlocal-context/\n");
+  await writeFile(join(cwd, ".worktreeinclude"), "local-context/\n");
+  await mkdir(join(cwd, "local-context"), { recursive: true });
+  await writeFile(join(cwd, "local-context", "value.txt"), "standalone local context\n");
+  execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["add", "README.md", ".gitignore", ".worktreeinclude"], { cwd });
+  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
+
+  let worktreePath;
+  let copiedContext;
+  let copiedManifest;
+  let branch;
+  const manager = createSubagentManager({
+    storageDir: join(cwd, "storage"),
+    createExecutor(root) {
+      return {
+        async execute(_task, options) {
+          const reference = await root.runStore.validateWorktree(options.worktreeOwner);
+          worktreePath = reference.path;
+          branch = reference.branch;
+          copiedContext = await readFile(join(reference.path, "local-context", "value.txt"), "utf8");
+          copiedManifest = await readFile(join(reference.path, ".worktreeinclude"), "utf8");
+          return { value: { cwd: reference.cwd }, attempts: [], cwd: reference.cwd };
+        },
+      };
+    },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const launched = await manager.run({ prompt: "work", worktree: "actual" }, context);
+    await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "completed");
+    assert.equal(typeof worktreePath, "string");
+    assert.equal(copiedContext, "standalone local context\n");
+    assert.equal(copiedManifest, "local-context/\n");
+    await waitFor(async () => typeof worktreePath === "string" && !(await stat(worktreePath).then(() => true, () => false)));
+    await waitFor(() => typeof branch === "string" && execFileSync("git", ["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === "");
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("disables worktree include copying for a new standalone retry", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-retry-worktreeinclude-"));
+  const created = [];
+  let executions = 0;
+  const manager = createSubagentManager({
+    storageDir: join(cwd, "storage"),
+    worktreeAdapter: {
+      async create(input) {
+        created.push(input);
+        return {
+          path: join(cwd, `worktree-${String(created.length)}`),
+          branch: `subagent/${String(created.length)}`,
+          cwd,
+          runStore: { async recordSystemPrompt() {}, async validateWorktree() { throw new Error("unused"); }, async worktree() { throw new Error("unused"); }, async snapshotWorktree() { throw new Error("unused"); } },
+          async cleanup() {},
+        };
+      },
+    },
+    createExecutor() {
+      return {
+        async execute() {
+          executions += 1;
+          if (executions === 1) throw new Error("first attempt");
+          return { value: "retried", attempts: [], cwd };
+        },
+      };
+    },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const first = await manager.run({ prompt: "retry", worktree: "retryable" }, context);
+    await waitFor(async () => (await manager.inspect({ id: first.id }, context)).state === "failed");
+    const retried = await manager.retry({ id: first.id }, context);
+    await waitFor(async () => (await manager.inspect({ id: retried.id }, context)).state === "completed");
+    assert.equal(created.length, 2);
+    assert.equal(created[0].copyIncludes, undefined);
+    assert.equal(created[1].copyIncludes, false);
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("isolates concurrent real-git worktrees with the same name", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-concurrent-"));
   await writeFile(join(cwd, "README.md"), "base\n");

@@ -133,6 +133,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     run.executor.setRunContext(runContext);
     await scheduler.cancelRun(run.store.runId);
     await run.lifecycle.resume();
+    run.store.disableWorktreeIncludes();
     const execution = runWorkflow(script, loaded.snapshot.args, withWorkflowFunctions({ tool: (identifier, args, signal, identity) => toolForRun(run.store, run.lifecycle, context?.toolContext, identifier, args, signal, identity), shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: workflowAgentHandler(run.store, run.metadata, run.lifecycle, run.executor, run.store.cwd, run.store.runId), worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, foreground, hasUI ? ui : undefined), phase: phaseBridge(run.store, run.metadata, run.lifecycle), log: logBridge(run.store, run.lifecycle, run.metadata.name), evidence: evidenceBridge(run.store, run.lifecycle) }, run.store, runContext, registry, snapshot.settings.extensionSettings), controller.signal);
     run.execution = execution;
     const completion = execution.result.then(async (value) => {

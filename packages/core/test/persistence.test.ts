@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -8,6 +8,7 @@ import test from "node:test";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
 import { atomicWriteFile } from "../src/io.js";
 import { hasLiveSessionLease, listRunIds, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
+import { copyWorktreeIncludes, worktreeIncludePlan } from "../src/worktreeinclude.js";
 import { callUnchecked, decodeTestJsonRecord, isTestRecord } from "./support.js";
 
 const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',description:'x'}", args: { answer: 42 }, metadata: { name: "x", description: "x" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] });
@@ -471,6 +472,257 @@ void test("persists awaiting checkpoints and atomically accepts only the first a
   assert.deepEqual(await store.replay(checkpoint.path), { path: checkpoint.path, value: true });
   assert.equal(await store.awaitCheckpoint(checkpoint), true);
   assert.deepEqual(await store.awaitingCheckpoints(), []);
+});
+
+
+void test("copies selected ignored context and copies .worktreeinclude itself, skipping on reuse/borrow/retry/resume", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-copy-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".gitignore"), ".pi/local/\nprivate/\nnot-selected/\n");
+  writeFileSync(join(repo, ".worktreeinclude"), ".pi/local/*\nprivate/\n!.pi/local/not-selected.md\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+
+  mkdirSync(join(repo, ".pi", "local"), { recursive: true });
+  mkdirSync(join(repo, "private"), { recursive: true });
+  mkdirSync(join(repo, "not-selected"), { recursive: true });
+  writeFileSync(join(repo, ".pi", "local", "skill.md"), "local skill");
+  writeFileSync(join(repo, ".pi", "local", "not-selected.md"), "not selected");
+  writeFileSync(join(repo, "private", "notes.md"), "private notes");
+  writeFileSync(join(repo, "not-selected", "notes.md"), "not selected");
+
+  // Locally modified .worktreeinclude should not trigger dirty-tree failure!
+  writeFileSync(join(repo, ".worktreeinclude"), ".pi/local/*\nprivate/\n!.pi/local/not-selected.md\n# dirty comment\n");
+
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create({ ...run(repo), state: "completed" }, snapshot);
+  const namedOwner = structuralPath("worktree", "named", "banana");
+  const worktree = await store.worktree(namedOwner);
+
+  assert.equal(readFileSync(join(worktree.path, "tracked.txt"), "utf8"), "initial");
+  assert.equal(readFileSync(join(worktree.path, ".pi", "local", "skill.md"), "utf8"), "local skill");
+  assert.equal(readFileSync(join(worktree.path, "private", "notes.md"), "utf8"), "private notes");
+  assert.equal(existsSync(join(worktree.path, ".pi", "local", "not-selected.md")), false);
+  assert.equal(existsSync(join(worktree.path, "not-selected", "notes.md")), false);
+
+  // Self-copy: .worktreeinclude must be copied to the worktree!
+  assert.equal(existsSync(join(worktree.path, ".worktreeinclude")), true);
+  assert.equal(readFileSync(join(worktree.path, ".worktreeinclude"), "utf8"), readFileSync(join(repo, ".worktreeinclude"), "utf8"));
+
+  // Reuse check: modifying repo files does not re-copy onto existing worktree
+  writeFileSync(join(repo, ".pi", "local", "skill.md"), "updated in repo");
+  const reused = await store.worktree(namedOwner);
+  assert.equal(readFileSync(join(reused.path, ".pi", "local", "skill.md"), "utf8"), "local skill");
+
+  // Borrowed follow-up check: follow-up run reuses worktree without re-copying
+  const followUp = new RunStore(repo, "session-a", "follow-up", home);
+  await followUp.create({ ...run(repo), id: "follow-up", parentRunId: "run-a", state: "completed" }, snapshot);
+  const borrowed = await followUp.worktree(namedOwner);
+  assert.equal(borrowed.path, worktree.path);
+
+  // Resume check: disableWorktreeIncludes disables copying on fresh worktrees during resume
+  const resumed = new RunStore(repo, "session-a", "resumed", home);
+  await resumed.create({ ...run(repo), id: "resumed" }, snapshot);
+  resumed.disableWorktreeIncludes();
+  const resumedWorktree = await resumed.worktree("resume-scope");
+  assert.equal(existsSync(join(resumedWorktree.path, ".pi", "local")), false);
+
+  // Retry check: retry provenance disables copying on fresh worktrees
+  const retryStore = new RunStore(repo, "session-a", "retry-run", home);
+  await retryStore.create({
+    ...run(repo),
+    id: "retry-run",
+    state: "running",
+    parentRunId: "run-a",
+    retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [], incompletePaths: [], namedWorktrees: ["banana"] },
+  }, snapshot);
+  const retryWorktree = await retryStore.worktree("retry-scope");
+  assert.equal(existsSync(join(retryWorktree.path, ".pi", "local")), false);
+
+  await store.delete(true);
+  await followUp.delete(true);
+  await resumed.delete(true);
+  await retryStore.delete(true);
+});
+
+void test("respects Git-native ignore semantics across repository, info/exclude, and global ignores", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-git-native-"));
+  const repo = join(home, "repo");
+  const globalExcludes = join(home, "global-excludes");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, ".gitignore"), "repository-context/\nunselected/\n");
+  writeFileSync(join(repo, ".worktreeinclude"), "repository-context/\ninfo-context/\nglobal-context/\n");
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".git", "info", "exclude"), "info-context/\n");
+  writeFileSync(globalExcludes, "global-context/\n");
+  execFileSync("git", ["-C", repo, "config", "core.excludesFile", globalExcludes]);
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+
+  for (const dir of ["repository-context", "info-context", "global-context", "unselected"]) {
+    mkdirSync(join(repo, dir), { recursive: true });
+  }
+  writeFileSync(join(repo, "repository-context", "value.txt"), "repository");
+  writeFileSync(join(repo, "info-context", "value.txt"), "info");
+  writeFileSync(join(repo, "global-context", "value.txt"), "global");
+  writeFileSync(join(repo, "unselected", "value.txt"), "unselected");
+
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const worktree = await store.worktree("ignore-sources");
+
+  assert.equal(readFileSync(join(worktree.path, "repository-context", "value.txt"), "utf8"), "repository");
+  assert.equal(readFileSync(join(worktree.path, "info-context", "value.txt"), "utf8"), "info");
+  assert.equal(readFileSync(join(worktree.path, "global-context", "value.txt"), "utf8"), "global");
+  assert.equal(existsSync(join(worktree.path, "unselected")), false);
+  await store.delete(true);
+});
+
+void test("rejects tracked and untracked non-ignored paths selected by .worktreeinclude", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-reject-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".worktreeinclude"), "tracked.txt\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+
+  const trackedStore = new RunStore(repo, "session-a", "tracked", home);
+  await trackedStore.create({ ...run(repo), id: "tracked" }, snapshot);
+  await assert.rejects(
+    trackedStore.worktree("tracked"),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("selected tracked path")
+  );
+
+  // Untracked non-ignored path selection
+  writeFileSync(join(repo, ".worktreeinclude"), "untracked.txt\n");
+  writeFileSync(join(repo, "untracked.txt"), "not ignored");
+  await assert.rejects(
+    worktreeIncludePlan(repo),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("not ignored by Git")
+  );
+});
+
+void test("enforces symlink safety: rejects absolute symlinks and links escaping root", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-symlinks-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, ".gitignore"), "abs-link\nesc-link\nsafe-link\n");
+  writeFileSync(join(repo, "target.txt"), "target");
+  symlinkSync("/etc/passwd", join(repo, "abs-link"));
+  symlinkSync("../../outside", join(repo, "esc-link"));
+  symlinkSync("target.txt", join(repo, "safe-link"));
+
+  // 1. Absolute symlink
+  writeFileSync(join(repo, ".worktreeinclude"), "abs-link\n");
+  const planAbs = await worktreeIncludePlan(repo);
+  const dstAbs = join(home, "dst-abs");
+  mkdirSync(dstAbs);
+  await assert.rejects(
+    copyWorktreeIncludes(repo, dstAbs, planAbs),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("unsafe absolute symlink")
+  );
+
+  // 2. Relative symlink escaping root
+  writeFileSync(join(repo, ".worktreeinclude"), "esc-link\n");
+  const planEsc = await worktreeIncludePlan(repo);
+  const dstEsc = join(home, "dst-esc");
+  mkdirSync(dstEsc);
+  await assert.rejects(
+    copyWorktreeIncludes(repo, dstEsc, planEsc),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("points outside repository")
+  );
+
+  // 3. Safe relative symlink
+  writeFileSync(join(repo, ".worktreeinclude"), "safe-link\n");
+  const planSafe = await worktreeIncludePlan(repo);
+  const dstSafe = join(home, "dst-safe");
+  mkdirSync(dstSafe);
+  await copyWorktreeIncludes(repo, dstSafe, planSafe);
+  assert.equal(lstatSync(join(dstSafe, "safe-link")).isSymbolicLink(), true);
+});
+
+void test("enforces bounds on maximum files and total bytes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-bounds-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  writeFileSync(join(repo, ".gitignore"), "file1.txt\nfile2.txt\n");
+  writeFileSync(join(repo, ".worktreeinclude"), "file1.txt\nfile2.txt\n");
+  writeFileSync(join(repo, "file1.txt"), "hello world");
+  writeFileSync(join(repo, "file2.txt"), "more bytes than limit");
+
+  const plan = await worktreeIncludePlan(repo);
+  const dst = join(home, "dst");
+  mkdirSync(dst);
+
+  // Exceed file count (limit = 1)
+  await assert.rejects(
+    copyWorktreeIncludes(repo, dst, plan, { maxFiles: 1 }),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("exceeded maximum file count")
+  );
+
+  // Exceed byte limit (limit = 5 bytes)
+  await assert.rejects(
+    copyWorktreeIncludes(repo, dst, plan, { maxBytes: 5 }),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("exceeded maximum total bytes")
+  );
+});
+
+
+void test("rejects sensitive files selected by .worktreeinclude", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-sensitive-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  writeFileSync(join(repo, ".gitignore"), ".env\nid_rsa\nserver.key\n");
+  writeFileSync(join(repo, ".worktreeinclude"), ".env\nid_rsa\nserver.key\n");
+  writeFileSync(join(repo, ".env"), "SECRET=true");
+  writeFileSync(join(repo, "id_rsa"), "PRIVATE KEY");
+  writeFileSync(join(repo, "server.key"), "KEY DATA");
+
+  const plan = await worktreeIncludePlan(repo);
+  const dst = join(home, "dst");
+  mkdirSync(dst);
+
+  await assert.rejects(
+    copyWorktreeIncludes(repo, dst, plan),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("selected sensitive file")
+  );
+});
+
+void test("rejects destination collisions and destination escapes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-worktreeinclude-collisions-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  writeFileSync(join(repo, ".gitignore"), "existing.txt\n");
+  writeFileSync(join(repo, ".worktreeinclude"), "existing.txt\n");
+  writeFileSync(join(repo, "existing.txt"), "new content");
+
+  const plan = await worktreeIncludePlan(repo);
+  const dst = join(home, "dst");
+  mkdirSync(dst);
+  writeFileSync(join(dst, "existing.txt"), "already there");
+
+  await assert.rejects(
+    copyWorktreeIncludes(repo, dst, plan),
+    (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("collides with existing content")
+  );
 });
 
 void test("creates worktrees from clean HEAD, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {

@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+- Copy selected Git-ignored local context and the manifest itself into physically new worktrees using `.worktreeinclude` and Git-native matching, with dirty-tree preflight ignore, destination escape protection, symlink source validation, and file/byte bounds (#291, #293).
+
 ## [6.3.0] - 2026-10-25
 
 **This minor version contains breaking changes.** Shipping them as 6.3.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.
