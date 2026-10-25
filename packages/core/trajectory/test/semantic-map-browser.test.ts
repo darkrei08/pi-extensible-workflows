@@ -66,12 +66,14 @@ async function runChrome(url: string, profile: string, callback: (evaluate: (exp
     socket = new WebSocket(endpoint);
     await new Promise<void>((resolve, reject) => { socket?.addEventListener("open", () => { resolve(); }, { once: true }); socket?.addEventListener("error", () => { reject(new Error("Chrome DevTools connection failed")); }, { once: true }); });
     const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>(); let nextId = 1;
-    socket.addEventListener("message", (event) => { try { const item = JSON.parse(String(event.data)) as { id?: number; result?: { result?: { value?: unknown }; exceptionDetails?: { text?: string } }; error?: { message?: string } }; if (typeof item.id !== "number") return; const request = pending.get(item.id); if (!request) return; pending.delete(item.id); if (item.error || item.result?.exceptionDetails) request.reject(new Error(item.error?.message ?? item.result?.exceptionDetails?.text ?? "Chrome evaluation failed")); else request.resolve(item.result?.result?.value); } catch { /* Ignore non-command events. */ } });
-    const evaluate = (expression: string): Promise<unknown> => new Promise((resolve, reject) => { const id = nextId++; pending.set(id, { resolve, reject }); socket?.send(JSON.stringify({ id, method: "Runtime.evaluate", params: { expression, returnByValue: true, awaitPromise: true } })); });
+    socket.addEventListener("message", (event) => { try { const item = JSON.parse(String(event.data)) as { id?: number; result?: { result?: { value?: unknown }; exceptionDetails?: { text?: string } }; error?: { message?: string } }; if (typeof item.id !== "number") return; const request = pending.get(item.id); if (!request) return; pending.delete(item.id); if (item.error || item.result?.exceptionDetails) request.reject(new Error(item.error?.message ?? item.result?.exceptionDetails?.text ?? "Chrome command failed")); else request.resolve(item.result?.result?.value); } catch { /* Ignore non-command events. */ } });
+    const command = (method: string, params: Record<string, unknown> = {}): Promise<unknown> => new Promise((resolve, reject) => { const id = nextId++; pending.set(id, { resolve, reject }); socket?.send(JSON.stringify({ id, method, params })); });
+    const evaluate = (expression: string): Promise<unknown> => command("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+    await command("Page.navigate", { url });
     await evaluate("void 0");
     for (let attempt = 0; attempt < 100; attempt += 1) { if (await evaluate("Boolean(window.__semanticMapCase)")) break; await wait(25); }
     const result = await evaluate("window.__semanticMapCase");
-    assert.ok(result && typeof result === "object", `Semantic Map fixture did not initialize: ${String(await evaluate("window.__semanticMapError"))}`);
+    assert.ok(result && typeof result === "object", `Semantic Map fixture did not initialize: ${String(await evaluate("JSON.stringify({error:window.__semanticMapError,readyState:document.readyState,viewer:Boolean(window.SemanticMap),svg:Boolean(document.querySelector('.diagram-container > svg')),html:document.body.innerHTML.slice(-500)})"))}`);
     await callback(evaluate);
   } finally {
     socket?.close(); child.kill("SIGTERM");

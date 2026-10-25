@@ -1,5 +1,5 @@
 /** Generated offline by scripts/build-semantic-map.mjs; included in Trajectory lock identity. */
-export const SEMANTIC_MAP_BUILD_STAMP = "d48e5e3be431480f";
+export const SEMANTIC_MAP_BUILD_STAMP = "bb92850942f4a5b5";
 export type SemanticMapAssetName = "index.html" | "semantic-map.html" | "semantic-map.js" | "semantic-map.css";
 export type SemanticMapAssetDigest = Readonly<{ bytes: number; sha256: string }>;
 /** Expected final bytes of the parent shell and the three browser assets for this build; a server constant, not a browser asset. */
@@ -8,9 +8,9 @@ export const SEMANTIC_MAP_ASSET_MANIFEST: Readonly<{ schema: 1; stamp: string; v
   stamp: SEMANTIC_MAP_BUILD_STAMP,
   versionParameter: "v",
   assets: Object.freeze({
-    "index.html": Object.freeze({ bytes: 185992, sha256: "c8ef928faf85b000838bcd76346403bdfc51f8d8b008ecdeec7c909addc0e11d" }),
-    "semantic-map.html": Object.freeze({ bytes: 772188, sha256: "01f5039c6b2601357c1807a87096d26b675e97c2da313c9f41aef3f8eb664070" }),
-    "semantic-map.js": Object.freeze({ bytes: 38346, sha256: "9e052ac39afea26381216393fe993ca6becc4fd2487562aa6b78f70107146192" }),
-    "semantic-map.css": Object.freeze({ bytes: 13136, sha256: "fd1ad887d051de00ff58552ec0e16277778e1c30853cfb0982b25bee57f3cdb8" })
+    "index.html": Object.freeze({ bytes: 186280, sha256: "493a366dec9e8b408ee47f42c03408444ce5030076a0d4bb163eb0b1fda809c2" }),
+    "semantic-map.html": Object.freeze({ bytes: 772188, sha256: "d44c1ada579e021a304593c4504c0116619b7b8b0ad47568414ecc8f5038c9f0" }),
+    "semantic-map.js": Object.freeze({ bytes: 38346, sha256: "420d988334bad7295cf2ed81063eb580663e7a3f5cbb2600dbe13294f3207a0a" }),
+    "semantic-map.css": Object.freeze({ bytes: 13136, sha256: "0c327edb0c79578dc46ac55100f7eefd09a905862f1c85e2a0fe016368fb19eb" })
   })
 });
