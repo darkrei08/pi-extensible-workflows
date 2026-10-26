@@ -629,6 +629,34 @@ void test("CLI TTY progress preserves log history while a non-settled agent anim
     }
   } finally { Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows }); }
 });
+void test("CLI TTY progress preserves a genuine append when an offscreen duration budget row changes", () => {
+  const makeRun = (phaseCount: number, durationMs: number): PersistedRun => ({
+    id: "duration-budget-progress",
+    workflowName: "cliDurationBudgetProgress",
+    cwd: "/project",
+    sessionId: "session",
+    state: "running",
+    budget: { durationMs: { hard: 60_000 } },
+    budgetVersion: 1,
+    usage: { tokens: 0, costUsd: 0, durationMs, agentLaunches: 0 },
+    phaseHistory: Array.from({ length: phaseCount }, (_, index) => ({ phase: `phase-${String(index)}`, afterAgent: 0 })),
+    agents: [],
+    agentSessions: [],
+  });
+  const previousRows = process.stderr.rows;
+  Object.defineProperty(process.stderr, "rows", { configurable: true, value: 5 });
+  let stderr = "";
+  try {
+    const progress = new CliProgress((text) => { stderr += text; }, true, () => {});
+    try {
+      progress.update(makeRun(8, 1_000));
+      progress.update(makeRun(9, 2_000));
+    } finally { progress.finish(); }
+  } finally { Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows }); }
+  const terminal = emulateTerminal(stderr, 5);
+  const finalOutput = [...terminal.history, ...terminal.screen];
+  assert.equal(finalOutput.filter((line) => line.includes("[Phase: phase-8]")).length, 1, finalOutput.join("\\n"));
+});
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();
   const paths = fixture();

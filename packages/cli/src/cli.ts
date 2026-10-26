@@ -481,13 +481,14 @@ export class CliProgress {
     const resized = this.#rows !== 0 && this.#rows !== rows;
     const visibleLimit = resized ? Math.min(this.#lines, visibleRows) : visibleRows;
     const visibleLines = Math.min(lines.length, Math.max(1, visibleLimit));
+    const firstVisible = lines.length - visibleLines;
     if (!this.#previousLines.length) {
       this.stderr(`\x1b[?25l\x1b[0J${lines.join("\n")}\n`);
     } else if (lines.length < this.#previousLines.length) {
       const text = lines.slice(-visibleLines).join("\n");
       this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, visibleRows))}A` : ""}\x1b[0J${text}\n`);
     } else {
-      const appended = lines.length > this.#previousLines.length && this.#previousLines.every((line, index) => line === lines[index] || index === 0 || (ANIMATED_PROGRESS_STATE.test(line) && ANIMATED_PROGRESS_STATE.test(lines[index] ?? "")));
+      const appended = lines.length > this.#previousLines.length && this.#previousLines.every((line, index) => index < firstVisible || line === lines[index] || index === 0 || (ANIMATED_PROGRESS_STATE.test(line) && ANIMATED_PROGRESS_STATE.test(lines[index] ?? "")));
       const changed = lines.slice(0, this.#previousLines.length).reduce<number[]>((indices, line, index) => {
         if (line !== this.#previousLines[index]) indices.push(index);
         return indices;
