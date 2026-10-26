@@ -426,7 +426,8 @@ function terminalProgressStyles(enabled: boolean): WorkflowProgressStyles {
   const style = (code: number) => enabled ? (text: string) => `\x1b[${String(code)}m${text}\x1b[0m` : (text: string) => text;
   return { accent: style(36), success: style(32), error: style(31), warning: style(33), muted: style(90), dim: style(2), bold: style(1) };
 }
-class CliProgress {
+const ANIMATED_PROGRESS_STATE = /\[(?:queued|running|waiting_for_child|retrying|paused)\]/;
+export class CliProgress {
   #lastStable = "";
   #lines = 0;
   #previousLines: string[] = [];
@@ -486,7 +487,7 @@ class CliProgress {
       const text = lines.slice(-visibleLines).join("\n");
       this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, visibleRows))}A` : ""}\x1b[0J${text}\n`);
     } else {
-      const appended = lines.length > this.#previousLines.length && this.#previousLines.every((line, index) => line === lines[index] || index === 0 || (line.includes("[running]") && lines[index]?.includes("[running]")));
+      const appended = lines.length > this.#previousLines.length && this.#previousLines.every((line, index) => line === lines[index] || index === 0 || (ANIMATED_PROGRESS_STATE.test(line) && ANIMATED_PROGRESS_STATE.test(lines[index] ?? "")));
       const changed = lines.slice(0, this.#previousLines.length).reduce<number[]>((indices, line, index) => {
         if (line !== this.#previousLines[index]) indices.push(index);
         return indices;

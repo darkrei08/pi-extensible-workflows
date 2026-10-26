@@ -13,8 +13,8 @@ import test from "node:test";
 
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
-import { formatWorkflowCliHelp, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { registerWorkflowExtension, WorkflowRegistry } from "pi-extensible-workflows";
+import { CliProgress, formatWorkflowCliHelp, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { registerWorkflowExtension, WorkflowRegistry, type PersistedRun } from "pi-extensible-workflows";
 
 import { isCliTestBundleExtension, isCliTestBundleModule, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
 import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
@@ -600,6 +600,34 @@ void test("CLI TTY progress preserves log history when a shell row is inserted",
   const finalOutput = [...terminal.history, ...terminal.screen];
   for (let index = 0; index < 5; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`record-${String(index)}`)).length, 1, finalOutput.join("\n"));
   for (let index = 0; index < 10; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`[Phase: phase-${String(index)}]`)).length, 1, finalOutput.join("\n"));
+});
+void test("CLI TTY progress preserves log history while a non-settled agent animates", () => {
+  const makeRun = (logCount: number, state: PersistedRun["agents"][number]["state"]): PersistedRun => ({
+    id: "waiting-agent-progress",
+    workflowName: "cliWaitingAgentProgress",
+    cwd: "/project",
+    sessionId: "session",
+    state: "running",
+    phaseHistory: Array.from({ length: 10 }, (_, index) => ({ phase: `phase-${String(index)}`, afterAgent: 0 })),
+    agents: [{ id: "agent", name: "parent", path: "agent", state, model: { provider: "fixture", model: "model" }, tools: ["agent"], attempts: 1, activity: { kind: "tool", text: "agent" } }],
+    agentSessions: [],
+    events: Array.from({ length: logCount }, (_, index) => ({ type: "log", message: `record-${String(index)}`, timestamp: index })),
+  });
+  const previousRows = process.stderr.rows;
+  Object.defineProperty(process.stderr, "rows", { configurable: true, value: 5 });
+  try {
+    for (const state of ["waiting_for_child", "retrying", "paused"] as const) {
+      let stderr = "";
+      const progress = new CliProgress((text) => { stderr += text; }, true, () => {});
+      try {
+        progress.update(makeRun(4, state));
+        progress.update(makeRun(5, state));
+      } finally { progress.finish(); }
+      const terminal = emulateTerminal(stderr, 5);
+      const finalOutput = [...terminal.history, ...terminal.screen];
+      for (let index = 0; index < 5; index += 1) assert.equal(finalOutput.filter((line) => line.includes(`record-${String(index)}`)).length, 1, `${state}: ${finalOutput.join("\\n")}`);
+    }
+  } finally { Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows }); }
 });
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();
