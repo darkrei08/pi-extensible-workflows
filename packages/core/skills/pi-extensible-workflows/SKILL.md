@@ -22,6 +22,47 @@ return await agent(
 );
 ```
 
+## Evidence-first review pipeline
+
+For agent-written changes that need review, express the path as deterministic stages rather than an informal loop:
+
+```js
+const result = await pipeline("change-review", { change: args }, {
+  verify: (item) => agent("Run the applicable checks and return exact evidence.", {
+    label: "[VERIFY] Change evidence",
+    skills: ["engineering-excellence"],
+    outputSchema: verificationSchema,
+  }),
+  review: (item, evidence) => agent("Review the requirement and new diff using the verification evidence.", {
+    label: "[REVIEW] Fresh context",
+    skills: ["engineering-excellence"],
+    outputSchema: reviewSchema,
+  }),
+  security: (item, review) => agent("Check security-sensitive paths and return evidence or NOT RUN.", {
+    label: "[SECURITY] Boundary check",
+    skills: ["engineering-excellence"],
+    outputSchema: securitySchema,
+  }),
+  risk: (item, security) => agent("Classify the changed paths and state the required human decision.", {
+    label: "[RISK] Approval tier",
+    skills: ["engineering-excellence"],
+    outputSchema: riskSchema,
+  }),
+});
+return result;
+```
+
+The example is a contract, not a claim that every repository has these schemas or agents. Use the smallest stages that apply, keep evidence structured, and report unavailable stages as `NOT RUN`, `BLOCKED`, or `UNVERIFIED`.
+
+Review convergence rules:
+
+- Verify findings independently before forwarding them as blockers; include file/line evidence, severity, causality, and disposition.
+- Cap fix/review rounds at three. After the cap, stop and reconsider the approach instead of replaying unchanged work.
+- After initial review, inspect only the new diff and suppress findings already posted.
+- Bind approval to the exact candidate commit; a new unverified commit requires a fresh review.
+- Convert confirmed incidents, reverts, and harmful false positives into expert-checked evaluator cases before changing reviewer prompts, tools, models, or policy.
+- Use `evidence()` for large logs and return compact references; never hide a failed check behind a truncated string.
+
 ## Runtime and safety rules
 
 Functions returned by `workflow_catalog` are globals inside workflow source. You can compose them with other workflow operations by calling them in `script`; pass their inputs through `args` when appropriate:
@@ -161,10 +202,12 @@ Registered extension functions receive `withWorktree` in context and can compose
 - If `model` is specified, it must be a configured alias or the canonical `provider/model:thinking` form. Aliases are listed by `workflow_catalog`; prefer a suitable alias over a hardcoded model. Never guess a model identifier: verify unknown names with `pi --list-models "search term"` first, then use the fully qualified identifier it returns.
 - Use `log(messageString)` for brief operator status and `phase(phaseName)` to signal the start of another phase.
 - Use `parallel()` for independent tasks with different flows and `pipeline()` when every keyed item follows the same ordered stages; do not duplicate identical chains in `parallel()`. Signatures are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; keys are stable task, item, and stage names.
+- For review pipelines, keep verification, review, security, and risk stages explicit and ordered; do not treat a model approval as a human approval or a structural pass as live acceptance.
 - Use a JavaScript loop for repeated work; each direct `agent(...)` call gets deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
 - Add `budget` only for aggregate limits; omit unless the user explicitly asks. Valid dimensions are exactly `tokens`, `costUsd`, `durationMs`, and `agentLaunches`; each is `{ soft?: number, hard?: number }` with `soft < hard`.
 - `budget_exhausted` runs resume through `workflow_resume`: omitted patch values stay unchanged, `null` removes a limit, and tightening resumes directly. Relaxation stores the exact proposal and returns `{ state: "awaiting_approval", proposalId }`; `workflow_respond` must answer that ID. Rejection leaves the run exhausted; approval applies the budget and cold-resumes it. `workflow_retry` is only for persisted `failed` runs and inherits cumulative usage; replay itself consumes no budget.
 - `parallel()` and `pipeline()` return keyed bare values; await them before use. Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings remain literal.
 - Every agent must call `workflow_result` exactly once to submit its final result; unstructured agents pass `{ result: "final response" }`, while `outputSchema` agents pass a schema-valid value. One repair prompt is built in. Use `outputSchema` only when another phase compares, aggregates, or validates a result, never for final prose. Omit `retries` unless an extra retry is justified and work is idempotent.
+- A review retry must be bounded and evidence-driven: retry only a failed stage with new evidence, cap three fix/review rounds, and re-review only the changed diff after the first pass.
 - Do not add persona specifications to agent prompts; define the task directly.
