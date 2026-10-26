@@ -202,7 +202,7 @@ async function validateRunArtifacts(store: RunStore, workflowScript: string, sta
   for (const record of ownership) if (record.parentId !== undefined && !ownershipIds.has(record.parentId)) throw new Error("Persisted ownership parent is missing");
   await store.validateDeletionWorktrees();
   const borrowed = await store.borrowedWorktrees();
-  await store.validateBorrowedWorktrees();
+  await store.validateBorrowedWorktrees(false);
   return borrowed.map(({ sourceRunId }) => ({ sourceRunId }));
 }
 

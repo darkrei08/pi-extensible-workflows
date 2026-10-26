@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
+
 ## [6.3.0] - 2026-10-25
 
 **This minor version contains breaking changes.** Shipping them as 6.3.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.

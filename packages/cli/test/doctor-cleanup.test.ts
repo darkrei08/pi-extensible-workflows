@@ -144,6 +144,30 @@ void test("doctor cleanup preserves a real borrowed worktree when deleting its b
   assert.equal(existsSync(original.path), true);
 });
 
+void test("doctor cleanup deletes a borrower and its source after the borrowed worktree was removed by hand", async () => {
+  const paths = fixture(); const now = 1_000_000_000_000;
+  const repo = join(paths.home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const repoPaths = { home: paths.home, cwd: repo };
+  const source = await makeRun(repoPaths, "source", "completed", now);
+  const owner = structuralPath("worktree", "named", "shared");
+  const original = await source.worktree(owner);
+  const child = await makeRun(repoPaths, "child", "completed", now, { parentRunId: "source" });
+  assert.deepEqual(await child.worktree(owner), original);
+  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", original.path]);
+  const report = await doctorCleanup({ ...repoPaths, olderThanDays: 90, yes: true, now });
+  assert.deepEqual(report.failures, []);
+  assert.deepEqual(report.deleted.map(({ runId }) => runId).sort(), ["child", "source"]);
+  assert.equal(existsSync(child.directory), false);
+  assert.equal(existsSync(source.directory), false);
+});
+
 void test("doctor cleanup rejects malformed nested records before deleting any sibling", async () => {
   const now = 1_000_000_000_000;
   const corruptions: readonly [string, string][] = [

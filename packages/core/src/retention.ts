@@ -69,7 +69,7 @@ async function scanRun(cwd: string, sessionId: string, runId: string, home: stri
   await store.loadOwnership();
   await store.systemPrompts();
   await store.validateDeletionWorktrees();
-  await store.validateBorrowedWorktrees();
+  await store.validateBorrowedWorktrees(false);
   if (loaded.run.retry) await store.validateRetrySource();
   const stateMtimeMs = (await stat(join(store.directory, "state.json"))).mtimeMs;
   const dependencies = runDependencyIds(loaded.run, await store.borrowedWorktrees());
