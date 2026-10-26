@@ -302,6 +302,7 @@
       <section id="operations">
         <h2>Operations and debugging</h2>
         <h3>Doctor and inspector</h3>
+        <p><code>piewf inspect [session-id] --json</code> includes an optional <code>result</code> for completed runs: <code>{ status: "available", value: ... }</code> when <code>result.json</code> is valid and at most 64 KB including formatting, or <code>{ status: "truncated", preview: "...", previewBytes: 4096, totalBytes: ... }</code> for larger files. The UTF-8-safe preview is at most 4096 bytes, is not validated, and may be incomplete JSON; read <code>artifacts.resultPath</code> for the full value. Missing files omit the field; unreadable, non-regular, symlinked, or malformed files report <code>status: "unavailable"</code> without hiding the run. Results are not redacted. <code>--summary</code> adds only <code>result=available</code>, <code>result=truncated</code>, or <code>result=unavailable</code>. Business outcomes such as <code>{ pass: false }</code> remain returned data, not execution failures: the run stays <code>completed</code>, and <code>--failed</code> still selects only execution failures.</p>
         <pre><code class="language-shell"><span class="tok-command">npx</span> -p @piewf/cli piewf --version
 <span class="tok-command">npx</span> -p @piewf/cli piewf --help
 <span class="tok-command">npx</span> -p @piewf/cli piewf doctor [--agent-options &lt;json&gt;] [--prompt &lt;text&gt;] [--json]

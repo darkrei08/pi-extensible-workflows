@@ -1,4 +1,6 @@
-import { existsSync, statSync } from "node:fs";
+import { constants, existsSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import { homedir } from "node:os";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
@@ -14,7 +16,12 @@ export interface WorkflowReport { name: string; description?: string; status: st
 export interface SessionReport { id: string; cwd: string; path: string; cost: number; models: readonly ModelUsage[]; workflows: readonly WorkflowReport[]; totalCost: number; totalModels: readonly ModelUsage[] }
 export interface InspectorViewState { view: "list" | "detail" | "script"; selected: number; scroll: number }
 export type InspectMode = "tui" | "json" | "summary";
-export interface PersistedSessionSummary { schemaVersion: 1; cwd: string; sessionId: string; runs: readonly RunSummary[] }
+type InspectedResult =
+  | { status: "available"; value: unknown }
+  | { status: "truncated"; preview: string; previewBytes: number; totalBytes: number }
+  | { status: "unavailable" };
+type InspectedRunSummary = RunSummary & { result?: InspectedResult };
+export interface PersistedSessionSummary { schemaVersion: 1; cwd: string; sessionId: string; runs: readonly InspectedRunSummary[] }
 
 type TranscriptSummary = { prompt?: string; cost: number; models: readonly ModelUsage[]; model?: string; thinking?: ModelSpec["thinking"] };
 type ToolResult = { toolCallId: string; isError: boolean; content: unknown; details?: unknown };
@@ -337,12 +344,56 @@ export function renderInspector(report: SessionReport, state: InspectorViewState
   const scroll = Math.max(0, Math.min(state.scroll, Math.max(0, fitted.length - room)));
   return [...header, ...fitted.slice(scroll, scroll + room), ...footer].slice(0, height);
 }
+// Bound disk reads and output; never follow a result symlink or block on a FIFO.
+// Normal workflow results up to 64 KB (such as 40 KB reports with diagnostics) are parsed inline as valid JSON.
+// Results exceeding 64 KB provide a safe UTF-8 text prefix and explicit size metadata.
+const RESULT_INLINE_BYTES = 64 * 1024;
+const RESULT_PREVIEW_BYTES = 4096;
+async function inspectResult(path: string): Promise<InspectedResult | undefined> {
+  try {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile()) return { status: "unavailable" };
+      if (stat.size > RESULT_INLINE_BYTES) {
+        const previewBuffer = Buffer.alloc(RESULT_PREVIEW_BYTES);
+        let bytesRead = 0;
+        while (bytesRead < previewBuffer.length) {
+          const chunk = await file.read(previewBuffer, bytesRead, previewBuffer.length - bytesRead, bytesRead);
+          if (chunk.bytesRead === 0) break;
+          bytesRead += chunk.bytesRead;
+        }
+        const decoder = new StringDecoder("utf8");
+        return {
+          status: "truncated",
+          preview: decoder.write(previewBuffer.subarray(0, bytesRead)),
+          previewBytes: bytesRead,
+          totalBytes: stat.size,
+        };
+      }
+      const buffer = Buffer.alloc(stat.size);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const chunk = await file.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+        if (chunk.bytesRead === 0) break;
+        bytesRead += chunk.bytesRead;
+      }
+      const value: unknown = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+      return { status: "available", value };
+    } finally { await file.close(); }
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
+    return { status: "unavailable" };
+  }
+}
 export async function loadPersistedSessionSummary(cwd: string, sessionId: string, home = homedir(), failedOnly = false): Promise<PersistedSessionSummary> {
-  const runs: RunSummary[] = [];
+  const runs: InspectedRunSummary[] = [];
   for (const runId of (await listRunIds(cwd, sessionId, home)).sort()) {
     try {
       const summary = await new RunStore(cwd, sessionId, runId, home).loadSummary();
-      if (!failedOnly || summary.state === "failed") runs.push(summary);
+      if (failedOnly && summary.state !== "failed") continue;
+      const result = summary.state === "completed" ? await inspectResult(summary.artifacts.resultPath) : undefined;
+      runs.push({ ...summary, ...(result ? { result } : {}) });
     } catch { /* Ignore corrupt or concurrently removed runs. */ }
   }
   return { schemaVersion: 1, cwd, sessionId, runs };
@@ -352,10 +403,10 @@ export async function loadPersistedSummaries(cwd: string, sessionId: string | un
   const sessions = await Promise.all(sessionIds.map((id) => loadPersistedSessionSummary(cwd, id, home, failedOnly)));
   return sessionId || !failedOnly ? sessions : sessions.filter((session) => session.runs.length > 0);
 }
-export function formatPersistedRunSummary(summary: RunSummary, sessionId = summary.sessionId): string {
+export function formatPersistedRunSummary(summary: InspectedRunSummary, sessionId = summary.sessionId): string {
   const counts = summary.agents.reduce<Record<string, number>>((result, agent) => { result[agent.state] = (result[agent.state] ?? 0) + 1; return result; }, {});
   const status = Object.entries(counts).map(([state, count]) => `${state}=${String(count)}`).join(", ") || "agents=0";
-  return `${sessionId} ${summary.runId} ${summary.workflowName} ${summary.state} ${status} updated=${summary.updatedAt}`;
+  return `${sessionId} ${summary.runId} ${summary.workflowName} ${summary.state} ${status} updated=${summary.updatedAt}${summary.result ? ` result=${summary.result.status}` : ""}`;
 }
 function nextState(current: InspectorViewState, key: string, workflowCount: number): InspectorViewState {
   if (current.view === "list") {
