@@ -426,12 +426,9 @@ function terminalProgressStyles(enabled: boolean): WorkflowProgressStyles {
   const style = (code: number) => enabled ? (text: string) => `\x1b[${String(code)}m${text}\x1b[0m` : (text: string) => text;
   return { accent: style(36), success: style(32), error: style(31), warning: style(33), muted: style(90), dim: style(2), bold: style(1) };
 }
-const ANIMATED_PROGRESS_STATE = /\[(?:queued|running|waiting_for_child|retrying|paused)\]/;
 export class CliProgress {
   #lastStable = "";
   #lines = 0;
-  #previousLines: string[] = [];
-  #rows = 0;
   #frame = 0;
   #run: PersistedRun | undefined;
   #runId: string | undefined;
@@ -475,42 +472,19 @@ export class CliProgress {
     }
     const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame++ % 10] ?? "◇";
     const width = process.stderr.columns || 80;
-    const rows = Math.max(1, process.stderr.rows || 24);
-    const visibleRows = Math.max(1, rows - 1);
-    const lines = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles), width);
-    const resized = this.#rows !== 0 && this.#rows !== rows;
-    const visibleLimit = resized ? Math.min(this.#lines, visibleRows) : visibleRows;
-    const visibleLines = Math.min(lines.length, Math.max(1, visibleLimit));
-    const firstVisible = lines.length - visibleLines;
-    if (!this.#previousLines.length) {
-      this.stderr(`\x1b[?25l\x1b[0J${lines.join("\n")}\n`);
-    } else if (lines.length < this.#previousLines.length) {
-      const text = lines.slice(-visibleLines).join("\n");
-      this.stderr(`${this.#lines ? `\x1b[${String(Math.min(this.#lines, visibleRows))}A` : ""}\x1b[0J${text}\n`);
-    } else {
-      const appended = lines.length > this.#previousLines.length && this.#previousLines.every((line, index) => index < firstVisible || line === lines[index] || index === 0 || (ANIMATED_PROGRESS_STATE.test(line) && ANIMATED_PROGRESS_STATE.test(lines[index] ?? "")));
-      const changed = lines.slice(0, this.#previousLines.length).reduce<number[]>((indices, line, index) => {
-        if (line !== this.#previousLines[index]) indices.push(index);
-        return indices;
-      }, []);
-      let output = appended ? lines.slice(this.#previousLines.length).map((line) => `${line}\n`).join("") : "";
-      const first = changed.find((index) => index >= lines.length - visibleLines);
-      if (first !== undefined) {
-        const last = lines.length > this.#previousLines.length && !appended ? lines.length - 1 : changed.at(-1) ?? first;
-        output += `\x1b[${String(lines.length - first)}A`;
-        for (let index = first; index <= last; index += 1) output += `\r\x1b[2K${lines[index] ?? ""}\n`;
-        const down = lines.length - last - 1;
-        if (down > 0) output += `\x1b[${String(down)}B`;
-      }
-      if (output) this.stderr(output);
+    // Keep the block within the viewport: a terminal cannot repaint rows that scrolled into its history.
+    const maxLines = Math.max(1, (process.stderr.rows || 24) - 1);
+    let lines = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles, Date.now(), false, undefined, false, maxLines), width);
+    if (lines.length > maxLines) {
+      const tail = maxLines - 2;
+      lines = tail > 0 ? [lines[0] ?? "", this.#styles.muted(`  … ${String(lines.length - 1 - tail)} more lines`), ...lines.slice(-tail)] : lines.slice(-maxLines);
     }
-    this.#previousLines = lines;
-    this.#rows = rows;
-    this.#lines = visibleLines;
+    this.stderr(`${this.#lines ? `\x1b[${String(this.#lines)}A` : ""}${this.#lines ? "" : "\x1b[?25l"}\x1b[0J${lines.join("\n")}\n`);
+    this.#lines = lines.length;
   }
   finish(): void {
     if (this.#timer) { clearInterval(this.#timer); this.#timer = undefined; }
-    if (this.#interactive && this.#lines) { this.stderr("\x1b[?25h"); this.#lines = 0; }
+    if (this.#interactive && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
     this.#run = undefined;
   }
 }
