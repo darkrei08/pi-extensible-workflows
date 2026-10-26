@@ -42,6 +42,21 @@ export type WorkflowErrorCode = (typeof ERROR_CODES)[number];
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonSchema = { [key: string]: JsonValue };
 type WorkflowSchema = JsonSchema | TSchema;
+export const CHILD_BRIEF_CHANGES_POLICIES = ["none", "commit", "keep"] as const;
+export type ChildBriefChangesPolicy = (typeof CHILD_BRIEF_CHANGES_POLICIES)[number];
+export const CHILD_BRIEF_REPORT_MODES = ["minimal", "full", "evidence"] as const;
+export type ChildBriefReportMode = (typeof CHILD_BRIEF_REPORT_MODES)[number];
+export type GovernedChildBrief = {
+  prompt: string;
+  intent?: string;
+  changes?: ChildBriefChangesPolicy;
+  tools?: string[];
+  excludeTools?: string[];
+  outputSchema?: JsonSchema;
+  report?: ChildBriefReportMode;
+  timeoutMs?: number | null;
+  [key: string]: JsonValue;
+};
 // Extra keys are reserved for extensions and forwarded as JSON to agentOptions; core options remain typed.
 export interface AgentOptions<Schema extends TSchema = never> {
   label?: string;
@@ -55,6 +70,7 @@ export interface AgentOptions<Schema extends TSchema = never> {
   outputSchema?: JsonSchema | Schema;
   retries?: number;
   timeoutMs?: number | null;
+  brief?: GovernedChildBrief;
   [key: string]: JsonValue | NoInfer<Schema>;
 }
 export type ParallelTasks = Record<string, () => JsonValue | Promise<JsonValue>>;
@@ -154,6 +170,7 @@ export interface AgentRecord {
   id: string;
   name: string;
   label?: string;
+  brief?: GovernedChildBrief;
   path: string;
   state: AgentState;
   parentId?: string;
