@@ -137,36 +137,28 @@ function phaseSummary(agents: readonly AgentRecord[], styles: WorkflowProgressSt
   return styles.muted(parts.join(" · "));
 }
 /**
- * Renders the run; with `maxLines`, a view taller than that limit switches to a compact one so the live block stays on screen.
+ * Renders the run; with `maxLines` (the live block), finished phases fold into one summary line and a view still taller than
+ * that limit switches to a compact one so the block stays on screen.
  * A block taller than the terminal pushes its changing header above the viewport, and pi-tui then clears and redraws the whole
  * scrollback on every update, which snaps the reader back to the bottom.
  */
 export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES, now = Date.now(), expanded = false, width?: number, showHint = false, maxLines?: number): string {
-  const full = workflowProgressLines(run, spinner, styles, now, expanded, width, showHint);
-  if (expanded || maxLines === undefined || full.length <= maxLines) return full.join("\n");
-  // Finished phases collapse to a summary line; the current one keeps failed, active, and the latest settled agents, in that priority.
+  if (expanded || maxLines === undefined) return workflowProgressLines(run, spinner, styles, now, expanded, width, showHint).join("\n");
   const phases = run.phaseHistory?.length ? run.phaseHistory : run.phase ? [{ phase: run.phase, afterAgent: 0 }] : [];
+  const folded = Math.max(0, phases.length - 1);
+  const full = workflowProgressLines(run, spinner, styles, now, false, width, showHint, undefined, folded);
+  if (full.length <= maxLines) return full.join("\n");
+  // The current phase keeps failed, active, and the latest settled agents, in that priority.
   const currentStart = Math.min(run.agents.length, phases.at(-1)?.afterAgent ?? 0);
   const current = run.agents.slice(currentStart);
   const recent = current.filter((agent) => SETTLED_AGENT_STATES.has(agent.state) && agent.state !== "failed").sort((left, right) => agentEnd(right) - agentEnd(left)).slice(0, COMPACT_RECENT_SETTLED);
   const candidates = [...current.filter((agent) => agent.state === "failed"), ...current.filter((agent) => ACTIVE_AGENT_STATES.has(agent.state)), ...recent];
-  const render = (count: number, folded = 0) => workflowProgressLines(run, spinner, styles, now, false, width, showHint, new Set(candidates.slice(0, count)), folded);
-  const mostAgents = (folded: number) => {
-    let low = 0;
-    let high = candidates.length;
-    while (low < high) { const middle = Math.ceil((low + high) / 2); if (render(middle, folded).length <= maxLines) low = middle; else high = middle - 1; }
-    return low;
-  };
-  const shownAgents = mostAgents(0);
-  if (render(shownAgents).length <= maxLines) return render(shownAgents).join("\n");
-  // Too many finished phases to list one per line: the oldest fold into one summary line, keeping the current phase's agents first and then as many recent phases as fit.
-  const closed = Math.max(0, phases.length - 1);
-  const foldedAgents = mostAgents(closed);
+  const render = (count: number) => workflowProgressLines(run, spinner, styles, now, false, width, showHint, new Set(candidates.slice(0, count)), folded);
   let low = 0;
-  let high = closed;
-  while (low < high) { const middle = Math.floor((low + high) / 2); if (render(foldedAgents, middle).length <= maxLines) high = middle; else low = middle + 1; }
+  let high = candidates.length;
+  while (low < high) { const middle = Math.ceil((low + high) / 2); if (render(middle).length <= maxLines) low = middle; else high = middle - 1; }
   // NOTE: the header, budget, and log lines are never folded, so a terminal shorter than those still overflows.
-  return render(foldedAgents, low).join("\n");
+  return render(low).join("\n");
 }
 function workflowProgressLines(run: PersistedRun, spinner: string, styles: WorkflowProgressStyles, now: number, expanded: boolean, width: number | undefined, showHint: boolean, shown?: ReadonlySet<AgentRecord>, folded = 0): string[] {
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;

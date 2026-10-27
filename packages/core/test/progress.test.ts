@@ -640,13 +640,15 @@ void test("workflow progress compacts only past the line limit and keeps its hea
     ...Array.from({ length: 8 }, (_, index) => makeAgent({ id: `run:q${String(index)}`, name: `queued-${String(index)}`, path: `run:q${String(index)}`, state: "queued" })),
   ];
   const run = makeRun({ workflowName: "wide", phase: "clean", phaseHistory: [{ phase: "inventory", afterAgent: 0 }, { phase: "clean", afterAgent: 12 }], agents, events: Array.from({ length: 6 }, (_, index) => ({ type: "log" as const, timestamp: now, message: `log ${String(index)}` })) });
+  const live = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 100).split("\n");
+  assert.ok(live.length < formatWorkflowProgress(run, "◇", undefined, now).split("\n").length);
+  assert.match(live.join("\n"), /… 1 earlier phase · 11 done · 1 failed/);
+  assert.match(live.join("\n"), /#13 ✓ agent-12 \[completed\]/);
   const full = formatWorkflowProgress(run, "◇", undefined, now).split("\n");
-  assert.equal(formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, full.length), full.join("\n"));
   const compact = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 16).split("\n");
   assert.ok(compact.length <= 16, compact.join("\n"));
   assert.equal(compact[0], full[0]);
-  assert.match(compact.join("\n"), /\[Phase: inventory\] 11 done · 1 failed · 16s · 18kt · \$0\.12/);
-  assert.match(compact.join("\n"), /#5 ✗ agent-4 \[failed\]/);
+  assert.match(compact.join("\n"), /… 1 earlier phase · 11 done · 1 failed · 16s · 18kt · \$0\.12/);
   for (const index of [0, 1, 2]) assert.match(compact.join("\n"), new RegExp(`#${String(33 + index)} ● live-${String(index)} \\[running\\]`));
   assert.match(compact.join("\n"), /… \+8 queued · \+\d+ done/);
   assert.equal(compact.filter((line) => /^\s+\d\d:\d\d:\d\d log /.test(line) || /log \d$/.test(line)).length, 3);
@@ -654,7 +656,7 @@ void test("workflow progress compacts only past the line limit and keeps its hea
   assert.equal(formatWorkflowProgress(run, "◇", undefined, now, true, undefined, false, 16).split("\n").length, formatWorkflowProgress(run, "◇", undefined, now, true).split("\n").length);
 });
 
-void test("workflow progress folds the oldest finished phases when one line each would overflow", () => {
+void test("live workflow progress folds every finished phase into one line", () => {
   const now = 10_000_000;
   const names = ["pin", "probe", "review", "gates", "merge"];
   const phaseHistory = Array.from({ length: 48 }, (_, index) => ({ phase: names[index % names.length] ?? "pin", afterAgent: index }));
@@ -662,11 +664,10 @@ void test("workflow progress folds the oldest finished phases when one line each
   const run = makeRun({ workflowName: "queue", phase: "pin", phaseHistory, agents });
   const compact = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 20).split("\n");
   assert.ok(compact.length <= 20, compact.join("\n"));
-  assert.ok(compact.length >= 18, compact.join("\n"));
   const text = compact.join("\n");
-  assert.match(text, /… \d+ earlier phases · \d+ done · 1 failed/);
+  assert.match(text, /… 47 earlier phases · 46 done · 1 failed/);
   assert.match(text, /#49 ● agent-48 \[running\]/);
-  assert.equal(compact.filter((line) => line.includes("[Phase: ")).at(-1)?.trim(), "[Phase: review]");
+  assert.deepEqual(compact.filter((line) => line.includes("[Phase: ")).map((line) => line.trim()), ["[Phase: review]"]);
 });
 
 void test("workflow progress block compacts only while the run is still live", () => {
