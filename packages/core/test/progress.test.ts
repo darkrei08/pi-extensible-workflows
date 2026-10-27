@@ -654,6 +654,21 @@ void test("workflow progress compacts only past the line limit and keeps its hea
   assert.equal(formatWorkflowProgress(run, "◇", undefined, now, true, undefined, false, 16).split("\n").length, formatWorkflowProgress(run, "◇", undefined, now, true).split("\n").length);
 });
 
+void test("workflow progress folds the oldest finished phases when one line each would overflow", () => {
+  const now = 10_000_000;
+  const names = ["pin", "probe", "review", "gates", "merge"];
+  const phaseHistory = Array.from({ length: 48 }, (_, index) => ({ phase: names[index % names.length] ?? "pin", afterAgent: index }));
+  const agents = Array.from({ length: 49 }, (_, index) => makeAgent({ id: `run:${String(index)}`, name: `agent-${String(index)}`, path: `run:${String(index)}`, state: index === 48 ? "running" : index === 3 ? "failed" : "completed", startedAt: now - 1_000 }));
+  const run = makeRun({ workflowName: "queue", phase: "pin", phaseHistory, agents });
+  const compact = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 20).split("\n");
+  assert.ok(compact.length <= 20, compact.join("\n"));
+  assert.ok(compact.length >= 18, compact.join("\n"));
+  const text = compact.join("\n");
+  assert.match(text, /… \d+ earlier phases · \d+ done · 1 failed/);
+  assert.match(text, /#49 ● agent-48 \[running\]/);
+  assert.equal(compact.filter((line) => line.includes("[Phase: ")).at(-1)?.trim(), "[Phase: review]");
+});
+
 void test("workflow progress block compacts only while the run is still live", () => {
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Parameters<typeof workflowProgressBlock>[1];
   const agents = Array.from({ length: 40 }, (_, index) => makeAgent({ id: `run:${String(index)}`, name: `agent-${String(index)}`, path: `run:${String(index)}`, state: index < 38 ? "completed" : "running" }));

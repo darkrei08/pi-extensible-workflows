@@ -150,14 +150,25 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", style
   const current = run.agents.slice(currentStart);
   const recent = current.filter((agent) => SETTLED_AGENT_STATES.has(agent.state) && agent.state !== "failed").sort((left, right) => agentEnd(right) - agentEnd(left)).slice(0, COMPACT_RECENT_SETTLED);
   const candidates = [...current.filter((agent) => agent.state === "failed"), ...current.filter((agent) => ACTIVE_AGENT_STATES.has(agent.state)), ...recent];
-  const render = (count: number) => workflowProgressLines(run, spinner, styles, now, false, width, showHint, new Set(candidates.slice(0, count)));
+  const render = (count: number, folded = 0) => workflowProgressLines(run, spinner, styles, now, false, width, showHint, new Set(candidates.slice(0, count)), folded);
+  const mostAgents = (folded: number) => {
+    let low = 0;
+    let high = candidates.length;
+    while (low < high) { const middle = Math.ceil((low + high) / 2); if (render(middle, folded).length <= maxLines) low = middle; else high = middle - 1; }
+    return low;
+  };
+  const shownAgents = mostAgents(0);
+  if (render(shownAgents).length <= maxLines) return render(shownAgents).join("\n");
+  // Too many finished phases to list one per line: the oldest fold into one summary line, keeping the current phase's agents first and then as many recent phases as fit.
+  const closed = Math.max(0, phases.length - 1);
+  const foldedAgents = mostAgents(closed);
   let low = 0;
-  let high = candidates.length;
-  while (low < high) { const middle = Math.ceil((low + high) / 2); if (render(middle).length <= maxLines) low = middle; else high = middle - 1; }
-  // NOTE: failures in finished phases always stay listed, so a run with more of them than maxLines still overflows.
-  return render(low).join("\n");
+  let high = closed;
+  while (low < high) { const middle = Math.floor((low + high) / 2); if (render(foldedAgents, middle).length <= maxLines) high = middle; else low = middle + 1; }
+  // NOTE: the header, budget, and log lines are never folded, so a terminal shorter than those still overflows.
+  return render(foldedAgents, low).join("\n");
 }
-function workflowProgressLines(run: PersistedRun, spinner: string, styles: WorkflowProgressStyles, now: number, expanded: boolean, width: number | undefined, showHint: boolean, shown?: ReadonlySet<AgentRecord>): string[] {
+function workflowProgressLines(run: PersistedRun, spinner: string, styles: WorkflowProgressStyles, now: number, expanded: boolean, width: number | undefined, showHint: boolean, shown?: ReadonlySet<AgentRecord>, folded = 0): string[] {
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const workflowIcon = runStateGlyph(run.state, spinner);
   const iconStyle = workflowIconStyle(run.state, styles);
@@ -205,7 +216,14 @@ function workflowProgressLines(run: PersistedRun, spinner: string, styles: Workf
     const summary = counts.filter(([, count]) => count > 0).map(([label, count]) => `+${String(count)} ${label}`).join(" · ");
     return [...renderAgents(listed, nested), ...(summary ? [`${nested ? "    " : "  "}${styles.muted(`… ${summary}${showHint ? expandHint() : ""}`)}`] : [])];
   };
+  const foldBoundary = Math.min(run.agents.length, Math.max(0, phases[folded]?.afterAgent ?? 0));
+  if (folded > 0) {
+    lines.push(`  ${styles.muted(`… ${String(folded)} earlier ${folded === 1 ? "phase" : "phases"} ·`)} ${phaseSummary(run.agents.slice(0, foldBoundary), styles)}`);
+    renderedAgents = foldBoundary;
+    nested = true;
+  }
   for (const [phaseIndex, phase] of phases.entries()) {
+    if (phaseIndex < folded) continue;
     const boundary = Math.max(renderedAgents, Math.min(run.agents.length, phase.afterAgent));
     const before = run.agents.slice(renderedAgents, boundary);
     if (shown && !nested && before.length) lines.push(`  ${phaseSummary(before, styles)}`);
