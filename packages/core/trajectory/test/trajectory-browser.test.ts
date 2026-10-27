@@ -86,8 +86,9 @@ async function connectDevtools(url: string): Promise<Devtools> {
 }
 
 // Chrome picks its own DevTools port and announces it on stderr, so no port is reserved and released before Chrome binds it.
-async function waitForDevtools(child: ReturnType<typeof spawn>, stderr: () => string): Promise<string> {
+async function waitForDevtools(child: ReturnType<typeof spawn>, stderr: () => string, expectedUrl: string): Promise<string> {
   const startedAt = Date.now();
+  const normalizedUrl = new URL(expectedUrl).href;
   let endpoint: string | undefined;
   const failure = (reason: string): Error => new Error(`Chrome ${reason} after ${String(Date.now() - startedAt)} ms (pid ${String(child.pid)}, exit code ${String(child.exitCode)}, signal ${String(child.signalCode)}, DevTools endpoint ${endpoint ?? "not announced"})${stderr() ? `: ${stderr().trim()}` : ""}`);
   for (;;) {
@@ -96,8 +97,8 @@ async function waitForDevtools(child: ReturnType<typeof spawn>, stderr: () => st
     if (endpoint !== undefined) {
       try {
         const response = await fetch(`http://${new URL(endpoint).host}/json`, { signal: AbortSignal.timeout(Math.max(1, DEVTOOLS_WAIT_MS - (Date.now() - startedAt))) });
-        const pages = await response.json() as Array<{ type?: unknown; webSocketDebuggerUrl?: unknown }>;
-        const page = pages.find((candidate) => candidate.type === "page" && typeof candidate.webSocketDebuggerUrl === "string");
+        const pages = await response.json() as Array<{ type?: unknown; url?: unknown; webSocketDebuggerUrl?: unknown }>;
+        const page = pages.find((candidate) => candidate.type === "page" && candidate.url === normalizedUrl && typeof candidate.webSocketDebuggerUrl === "string");
         const websocketUrl = page?.webSocketDebuggerUrl;
         if (typeof websocketUrl === "string") return websocketUrl;
       } catch { /* The page target is not listed yet. */ }
@@ -121,33 +122,37 @@ async function serve(routes: ReadonlyMap<string, RouteBody>): Promise<{ url: str
   return { url: `http://127.0.0.1:${String(address.port)}`, close: () => new Promise<void>((resolve, reject) => { server.close((error) => { if (error) reject(error); else resolve(); }); }) };
 }
 
+function signalBrowser(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
+  if (process.platform === "win32") { child.kill(signal); return; }
+  try { process.kill(-child.pid, signal); } catch { child.kill(signal); }
+}
+
 async function withChrome(url: string, signal: AbortSignal, callback: (page: Devtools) => Promise<void>): Promise<void> {
   const browser = findBrowser();
   assert.ok(browser, "Chromium is required for Trajectory browser verification");
   const profile = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-chrome-"));
-  const child = spawn(browser, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, url], { stdio: ["ignore", "ignore", "pipe"] });
+  const child = spawn(browser, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, url], { detached: process.platform !== "win32", stdio: ["ignore", "ignore", "pipe"] });
   const stderr: string[] = [];
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => { stderr.push(chunk); });
   const childExited = new Promise<void>((resolve) => { child.once("close", () => { resolve(); }); });
   // A test timeout abandons this function without running its cleanup, so the browser is killed from the test's signal.
-  const killOnAbort = (): void => { child.kill("SIGKILL"); };
+  const killOnAbort = (): void => { signalBrowser(child, "SIGKILL"); };
   signal.addEventListener("abort", killOnAbort, { once: true });
   let page: Devtools | undefined;
   try {
-    page = await connectDevtools(await waitForDevtools(child, () => stderr.join("")));
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (await page.evaluate("document.readyState === 'complete'")) break;
-      await delay(25);
-    }
+    page = await connectDevtools(await waitForDevtools(child, () => stderr.join(""), url));
+    await page.command("Page.navigate", { url });
+    await waitFor(page, `location.href === ${JSON.stringify(new URL(url).href)} && document.readyState === 'complete'`);
     await callback(page);
   } finally {
     signal.removeEventListener("abort", killOnAbort);
     page?.close();
-    child.kill("SIGTERM");
+    signalBrowser(child, "SIGTERM");
     await Promise.race([childExited, delay(2000)]);
     // A browser stuck in startup can ignore SIGTERM; it must not outlive the test.
-    if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await Promise.race([childExited, delay(2000)]); }
+    if (child.exitCode === null && child.signalCode === null) { signalBrowser(child, "SIGKILL"); await Promise.race([childExited, delay(2000)]); }
     for (let attempt = 0; attempt < 10; attempt += 1) {
       try { rmSync(profile, { recursive: true, force: true }); break; } catch { await delay(50); }
     }
