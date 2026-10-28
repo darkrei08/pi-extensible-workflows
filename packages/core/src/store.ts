@@ -505,7 +505,7 @@ export class RunStore {
     catch (error) { throw coerceWorkflowError("RESUME_INCOMPATIBLE", error); }
   }
 
-  private async ownedWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
+  private async ownedWorktree(owner: string, cwd?: string, requireDirectory = true): Promise<WorktreeReference> {
     const records = await this.#loadWorktreeRecords(false);
     const matches = records.filter((candidate) => candidate.owner === owner);
     if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`);
@@ -513,14 +513,14 @@ export class RunStore {
     if (!record) throw new Error(`Missing or duplicate worktree record for ${owner}`);
     const validated = this.structuralWorktree(owner, record);
     if (cwd !== undefined && resolve(cwd) !== resolve(validated.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
-    await access(validated.cwd);
+    if (requireDirectory) await access(validated.cwd);
     return validated;
   }
 
-  private async resolveBorrowedWorktree(binding: BorrowedWorktreeBinding, seen: Set<string>): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string }> {
+  private async resolveBorrowedWorktree(binding: BorrowedWorktreeBinding, seen: Set<string>, requireDirectory = true): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string }> {
     try {
       const source = await this.sourceRun(binding.sourceRunId);
-      const resolved = await source.findNamedWorktree(binding.name, seen);
+      const resolved = await source.findNamedWorktree(binding.name, seen, requireDirectory);
       if (!resolved) throw new Error(`Missing named worktree ${binding.name} in source run ${binding.sourceRunId}`);
       if (resolved.owner !== binding.owner) throw new Error(`Borrowed worktree binding does not match source owner for ${binding.name}`);
       return resolved;
@@ -529,7 +529,7 @@ export class RunStore {
     }
   }
 
-  private async findNamedWorktree(name: string, seen: Set<string> = new Set()): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string } | undefined> {
+  private async findNamedWorktree(name: string, seen: Set<string> = new Set(), requireDirectory = true): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string } | undefined> {
     const owner = this.namedWorktreeOwner(name);
     if (seen.has(this.runId)) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree bindings contain a cycle");
     const nextSeen = new Set(seen);
@@ -539,7 +539,7 @@ export class RunStore {
       const loaded = await this.load();
       if (loaded.run.parentRunId === undefined) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree ${name} has no parent run`);
       const parent = await this.sourceRun(loaded.run.parentRunId);
-      const resolved = await parent.findNamedWorktree(name, nextSeen);
+      const resolved = await parent.findNamedWorktree(name, nextSeen, requireDirectory);
       if (!resolved || resolved.sourceRunId !== binding.sourceRunId || resolved.owner !== binding.owner) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree binding for ${name} is not inherited from its parent run`);
       return resolved;
     }
@@ -549,10 +549,10 @@ export class RunStore {
       const loaded = await this.load();
       if (loaded.run.parentRunId === undefined) return undefined;
       const parent = await this.sourceRun(loaded.run.parentRunId);
-      return parent.findNamedWorktree(name, nextSeen);
+      return parent.findNamedWorktree(name, nextSeen, requireDirectory);
     }
     try {
-      const reference = await this.ownedWorktree(owner);
+      const reference = await this.ownedWorktree(owner, undefined, requireDirectory);
       return { reference, sourceRunId: this.runId, owner };
     } catch (error) {
       throw coerceWorkflowError("WORKTREE_FAILED", error);
@@ -584,11 +584,12 @@ export class RunStore {
   }
 
 
-  async validateBorrowedWorktrees(): Promise<void> {
+  /** With requireDirectory false only the bindings are checked: deletion treats a worktree directory removed by hand as already cleaned up. */
+  async validateBorrowedWorktrees(requireDirectory = true): Promise<void> {
     try {
       const loaded = await this.load();
       if (loaded.run.parentRunId !== undefined) await this.validateParentRun(loaded.run.parentRunId);
-      for (const binding of await this.borrowedWorktreeRecords()) await this.resolveBorrowedWorktree(binding, new Set([this.runId]));
+      for (const binding of await this.borrowedWorktreeRecords()) await this.resolveBorrowedWorktree(binding, new Set([this.runId]), requireDirectory);
     } catch (error) {
       throw coerceWorkflowError("WORKTREE_FAILED", error);
     }
