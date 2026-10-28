@@ -88,8 +88,9 @@ void test("validates programmatic case overrides before starting Pi", async () =
 });
 void test("does not publish the eval harness, cases, or fixtures", () => {
   const output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: process.cwd(), encoding: "utf8" });
-  const reports = JSON.parse(output) as Array<{ files?: Array<{ path: string }> }>;
-  const files = reports[0]?.files?.map(({ path }) => path) ?? [];
+  // npm 12 keys the report by package name; earlier versions return an array.
+  const reports = JSON.parse(output) as Array<{ files?: Array<{ path: string }> }> | Record<string, { files?: Array<{ path: string }> }>;
+  const files = (Array.isArray(reports) ? reports : Object.values(reports)).flatMap((report) => report.files ?? []).map(({ path }) => path);
   assert.ok(files.length > 0);
   assert.equal(files.some((path) => path.startsWith("evals/") || path.startsWith("dist/evals/") || path.startsWith("test/")), false, "eval harness files must stay out of the published package");
 });
