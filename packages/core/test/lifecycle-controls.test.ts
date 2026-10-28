@@ -457,7 +457,7 @@ void test("cold resume does not duplicate the phase recorded before interruption
     for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
     const resumed = (await store.load()).run;
     assert.equal(resumed.state, "completed");
-    assert.deepEqual(resumed.phaseHistory?.filter(({ phase }) => phase === "build"), [{ phase: "build", afterAgent: 0 }]);
+    assert.deepEqual(resumed.phaseHistory?.filter(({ phase }) => phase === "build").map(({ phase, afterAgent }) => ({ phase, afterAgent })), [{ phase: "build", afterAgent: 0 }]);
   } finally {
     release();
     await secondShutdown?.();

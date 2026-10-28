@@ -182,7 +182,7 @@ export type WorkflowDeliveryStatus = "attached" | "pending" | "delivered";
 export interface WorkflowRunDelivery { mode: WorkflowDeliveryMode; state: WorkflowDeliveryStatus; toolCallId?: string }
 export interface WorkflowRunEvent { type: string; message: string; timestamp?: number }
 export interface WorkflowRetryProvenance { sourceRunId: string; lineageRootRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[] }
-export interface WorkflowPhaseRecord { phase: string; afterAgent: number }
+export interface WorkflowPhaseRecord { phase: string; afterAgent: number; startedAt?: number }
 export interface WorkflowPhaseShellActivity { phaseIndex: number; active: number; startedAt: number }
 /** A script call recorded for inspection. Tool payloads stay in the replay journal, not this record. Oversized shell inputs are JSON prefixes, with `inputBytes` their full size. */
 export interface WorkflowScriptCall { kind: "shell" | "tool"; name: string; path: string; input?: JsonValue; inputBytes?: number; phase?: string; startedAt: number; finishedAt?: number; error?: { code: WorkflowErrorCode; message?: string } }

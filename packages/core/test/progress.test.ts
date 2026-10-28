@@ -266,6 +266,14 @@ void test("workflow progress nests active shell under its phase occurrence", () 
   assert.match(progress, /\[Phase: verify\]\n\s{4}◇ shell \[running\] \(1 active\)/);
   assert.doesNotMatch(progress, /\n\s{2}◇ shell \[running\]/);
 });
+void test("collapsed workflow progress hides finished phases that ran no agents and have no live shell", () => {
+  const phaseHistory = [{ phase: "review", afterAgent: 0 }, { phase: "gates", afterAgent: 1 }, { phase: "merge", afterAgent: 1 }, { phase: "probe", afterAgent: 1 }, { phase: "pin", afterAgent: 2 }];
+  const agents = [makeAgent({ id: "run:1", name: "review", path: "run:1", state: "completed" }), makeAgent({ id: "run:2", name: "probe", path: "run:2", state: "completed" })];
+  const run = makeRun({ workflowName: "queue", phase: "pin", phaseHistory, agents, activeShellsByPhase: [{ phaseIndex: 2, active: 1, startedAt: 0 }] });
+  const phases = (expanded: boolean) => formatWorkflowProgress(run, "◇", undefined, 65_432, expanded).split("\n").filter((line) => line.includes("[Phase: ")).map((line) => line.trim());
+  assert.deepEqual(phases(false), ["[Phase: review]", "[Phase: merge]", "[Phase: probe]", "[Phase: pin]"]);
+  assert.deepEqual(phases(true), ["[Phase: review]", "[Phase: gates]", "[Phase: merge]", "[Phase: probe]", "[Phase: pin]"]);
+});
 void test("navigator keeps agent rows compact while preserving identity and state", () => {
   const run = makeRun({ workflowName: "policy", agents: [makeAgent({ id: "run:1", name: "review", path: "run:1", model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read", "grep"] })] });
   const dashboard = formatNavigatorDashboard(run, [], []);
@@ -484,7 +492,7 @@ void test("foreground workflow progress reports a shell waiting after agents set
   const shellStartedAt = live.activeShellStartedAt;
   assert.equal(typeof shellStartedAt, "number");
   assert.ok(typeof shellStartedAt === "number" && shellStartedAt <= Date.now());
-  assert.match(formatWorkflowProgress(live), /\[Phase: verify\]\n\s{4}.*shell \[running\] \(1 active\)/);
+  assert.match(formatWorkflowProgress(live), /\[Phase: verify\] \d+s\n\s{4}.*shell \[running\] \(1 active\)/);
   writeFileSync(releasePath, "release");
   const result = await running as { details: { run: PersistedRun } };
   assert.equal(result.details.run.activeShells, undefined);
@@ -640,23 +648,46 @@ void test("workflow progress compacts only past the line limit and keeps its hea
     ...Array.from({ length: 8 }, (_, index) => makeAgent({ id: `run:q${String(index)}`, name: `queued-${String(index)}`, path: `run:q${String(index)}`, state: "queued" })),
   ];
   const run = makeRun({ workflowName: "wide", phase: "clean", phaseHistory: [{ phase: "inventory", afterAgent: 0 }, { phase: "clean", afterAgent: 12 }], agents, events: Array.from({ length: 6 }, (_, index) => ({ type: "log" as const, timestamp: now, message: `log ${String(index)}` })) });
-  const live = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 100).split("\n");
-  assert.ok(live.length < formatWorkflowProgress(run, "◇", undefined, now).split("\n").length);
-  assert.match(live.join("\n"), /… 1 earlier phase · 11 done · 1 failed/);
-  assert.match(live.join("\n"), /#13 ✓ agent-12 \[completed\]/);
   const full = formatWorkflowProgress(run, "◇", undefined, now).split("\n");
+  assert.equal(formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, full.length), full.join("\n"));
   const compact = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 16).split("\n");
   assert.ok(compact.length <= 16, compact.join("\n"));
   assert.equal(compact[0], full[0]);
-  assert.match(compact.join("\n"), /… 1 earlier phase · 11 done · 1 failed · 16s · 18kt · \$0\.12/);
+  assert.match(compact.join("\n"), /\[Phase: inventory\] 11 done · 1 failed · 16s · 18kt · \$0\.12/);
+  assert.match(compact.join("\n"), /#5 ✗ agent-4 \[failed\]/);
   for (const index of [0, 1, 2]) assert.match(compact.join("\n"), new RegExp(`#${String(33 + index)} ● live-${String(index)} \\[running\\]`));
   assert.match(compact.join("\n"), /… \+8 queued · \+\d+ done/);
   assert.equal(compact.filter((line) => /^\s+\d\d:\d\d:\d\d log /.test(line) || /log \d$/.test(line)).length, 3);
-  // Expanded view is the reader's explicit choice and is never compacted.
-  assert.equal(formatWorkflowProgress(run, "◇", undefined, now, true, undefined, false, 16).split("\n").length, formatWorkflowProgress(run, "◇", undefined, now, true).split("\n").length);
 });
 
-void test("live workflow progress folds every finished phase into one line", () => {
+void test("expanded workflow progress gives up logs, then old phase agents, and phase lines last", () => {
+  const now = 10_000_000;
+  const phaseHistory = ["pin", "review", "gates", "fix"].map((phase, index) => ({ phase, afterAgent: index * 4, startedAt: now - 60_000 * (4 - index) }));
+  const agents = Array.from({ length: 16 }, (_, index) => makeAgent({ id: `run:${String(index)}`, name: `agent-${String(index)}`, path: `run:${String(index)}`, state: index === 15 ? "running" : index === 1 ? "failed" : "completed", startedAt: now - 1_000 }));
+  const run = makeRun({ workflowName: "queue", phase: "fix", phaseHistory, agents, events: Array.from({ length: 6 }, (_, index) => ({ type: "log" as const, timestamp: now, message: `log ${String(index)}` })) });
+  const view = (maxLines?: number) => formatWorkflowProgress(run, "◇", undefined, now, true, undefined, false, maxLines).split("\n");
+  const full = view();
+  assert.match(full.join("\n"), /\[Phase: review\] 1m\n/);
+  assert.match(full.join("\n"), /\[Phase: fix\] 1m\n/);
+  // Logs shrink first.
+  const fewerLogs = view(full.length - 2);
+  assert.equal(fewerLogs.length, full.length - 2);
+  assert.equal(fewerLogs.filter((line) => /log \d$/.test(line)).length, 4);
+  // Without logs, the oldest phases keep only their summary and failures.
+  const summarized = view(full.length - 10).join("\n");
+  assert.doesNotMatch(summarized, /Logs|log \d/);
+  assert.match(summarized, /\[Phase: pin\] 3 done · 1 failed · 1m\n/);
+  assert.match(summarized, /#2 ✗ agent-1 \[failed\]/);
+  assert.doesNotMatch(summarized, /agent-0 /);
+  assert.match(summarized, /#16 ● agent-15 \[running\]/);
+  for (const phase of ["pin", "review", "gates", "fix"]) assert.match(summarized, new RegExp(`\\[Phase: ${phase}\\]`));
+  // Phase lines fold last.
+  const folded = view(6).join("\n");
+  assert.match(folded, /… \d earlier phases?/);
+  assert.match(folded, /\[Phase: fix\]/);
+});
+
+void test("workflow progress folds the oldest finished phases when one line each would overflow", () => {
   const now = 10_000_000;
   const names = ["pin", "probe", "review", "gates", "merge"];
   const phaseHistory = Array.from({ length: 48 }, (_, index) => ({ phase: names[index % names.length] ?? "pin", afterAgent: index }));
@@ -664,10 +695,11 @@ void test("live workflow progress folds every finished phase into one line", () 
   const run = makeRun({ workflowName: "queue", phase: "pin", phaseHistory, agents });
   const compact = formatWorkflowProgress(run, "◇", undefined, now, false, undefined, false, 20).split("\n");
   assert.ok(compact.length <= 20, compact.join("\n"));
+  assert.ok(compact.length >= 18, compact.join("\n"));
   const text = compact.join("\n");
-  assert.match(text, /… 47 earlier phases · 46 done · 1 failed/);
+  assert.match(text, /… \d+ earlier phases · \d+ done · 1 failed/);
   assert.match(text, /#49 ● agent-48 \[running\]/);
-  assert.deepEqual(compact.filter((line) => line.includes("[Phase: ")).map((line) => line.trim()), ["[Phase: review]"]);
+  assert.equal(compact.filter((line) => line.includes("[Phase: ")).at(-1)?.trim(), "[Phase: review]");
 });
 
 void test("workflow progress block compacts only while the run is still live", () => {

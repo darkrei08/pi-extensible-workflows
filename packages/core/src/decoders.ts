@@ -378,8 +378,8 @@ function decodeBudgetEvent(value: unknown): BudgetEvent | undefined {
   return { type: value.type, budgetVersion: value.budgetVersion, dimensions, usage, limits, at: value.at, ...(proposalId === undefined ? {} : { proposalId }), ...(previous === undefined ? {} : { previous }), ...(proposed === undefined ? {} : { proposed }) };
 }
 function decodePhaseRecord(value: unknown): PersistedPhaseRecord | undefined {
-  if (!object(value) || typeof value.phase !== "string" || !integer(value.afterAgent)) return undefined;
-  return { phase: value.phase, afterAgent: value.afterAgent };
+  if (!object(value) || typeof value.phase !== "string" || !integer(value.afterAgent) || value.startedAt !== undefined && !finiteNumber(value.startedAt)) return undefined;
+  return { phase: value.phase, afterAgent: value.afterAgent, ...(value.startedAt === undefined ? {} : { startedAt: value.startedAt }) };
 }
 function decodeShellActivity(value: unknown): PersistedShellActivity | undefined {
   if (!object(value) || !integer(value.phaseIndex) || !integer(value.active) || !finiteNumber(value.startedAt)) return undefined;

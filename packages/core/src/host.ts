@@ -611,7 +611,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           }
           const phaseHistoryIndex = history.length;
           cursor = history.length + 1;
-          return { ...current, phase, phaseHistoryIndex, phaseHistory: [...history, { phase, afterAgent: current.agents.length }] };
+          return { ...current, phase, phaseHistoryIndex, phaseHistory: [...history, { phase, afterAgent: current.agents.length, startedAt: Date.now() }] };
         });
         await eventPublisher.phase(store, metadata, previousPhase, phase);
         runs.get(store.runId)?.update?.(workflowToolUpdate(persisted));

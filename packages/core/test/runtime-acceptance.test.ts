@@ -1227,7 +1227,7 @@ void test("shell and agent calls are recorded in the phase current when they wer
   for (const [name, script] of [["script-agent", `phase("a"); const w = agent("work"); phase("b"); await w;`], ["function-agent", "await lateAgent({});"]] as const) {
     await t.test(name, async () => {
       const run = await record(name, script);
-      assert.deepEqual(run.phaseHistory, [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 1 }], "the agent belongs to phase a");
+      assert.deepEqual(run.phaseHistory?.map(({ phase, afterAgent }) => ({ phase, afterAgent })), [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 1 }], "the agent belongs to phase a");
     });
   }
   await t.test("script-tool", async () => {
@@ -1241,14 +1241,14 @@ void test("shell and agent calls are recorded in the phase current when they wer
       const running = start("queued-agent", `phase("a"); const x = agent("one"); const y = agent("two"); phase("b"); await x; await y; await agent("three");`, 1);
       const store = await storeOf("queued-agent run");
       const mid = await until("phase b after two agents", store, (run) => run.phaseHistory?.length === 2 && run.agents.length === 2);
-      assert.deepEqual(mid.phaseHistory, [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 2 }]);
+      assert.deepEqual(mid.phaseHistory?.map(({ phase, afterAgent }) => ({ phase, afterAgent })), [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 2 }]);
       assert.equal(mid.agents[1]?.state, "queued", "agent two waits for the slot");
       gated.release();
       await within("queued-agent workflow", running);
       const done = (await store.load()).run;
       assert.equal(done.state, "completed");
       assert.equal(done.agents.length, 3);
-      assert.deepEqual(done.phaseHistory, [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 2 }]);
+      assert.deepEqual(done.phaseHistory?.map(({ phase, afterAgent }) => ({ phase, afterAgent })), [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 2 }]);
       assert.equal(done.phase, "b");
     } finally { gate = undefined; }
   });
@@ -1274,7 +1274,8 @@ void test("shell and agent calls are recorded in the phase current when they wer
     await within("stopped workflow call", assert.rejects(running, cancelled));
     const run = (await store.load()).run;
     assert.equal(run.state, "stopped");
-    assert.deepEqual(run.phaseHistory, [{ phase: "a", afterAgent: 0 }]);
+    assert.deepEqual(run.phaseHistory?.map(({ phase, afterAgent }) => ({ phase, afterAgent })), [{ phase: "a", afterAgent: 0 }]);
+    assert.ok(run.phaseHistory.every((entry) => typeof entry.startedAt === "number"));
     for (const { kind, phase } of run.scriptCalls ?? []) assert.deepEqual([kind, phase], ["shell", "a"]);
   });
   await t.test("approving the checkpoint releases the shell held at the lifecycle gate and its phase update", async () => {
@@ -1298,7 +1299,7 @@ void test("shell and agent calls are recorded in the phase current when they wer
       assert.equal(stopped.details.stopped, true);
       await within("stopped workflow call", assert.rejects(running, cancelled));
       const run = (await store.load()).run;
-      assert.deepEqual(run.phaseHistory, [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 1 }]);
+      assert.deepEqual(run.phaseHistory?.map(({ phase, afterAgent }) => ({ phase, afterAgent })), [{ phase: "a", afterAgent: 0 }, { phase: "b", afterAgent: 1 }]);
       assert.equal(run.agents[0]?.state, "cancelled");
     } finally { gate = undefined; }
   });
