@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -298,6 +298,68 @@ void test("non-TTY inspection discovers persisted runs without a transcript", as
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
   }
 });
+void test("inspect exposes bounded completed return values without changing failure semantics", async () => {
+  const home = mkdtempSync(join(tmpdir(), "piewf-inspect-results-"));
+  const cwd = join(home, "project");
+  const sessionId = "results";
+  const cases = [
+    { id: "business", value: { pass: false, stoppedReason: "review-failed", diagnostics: "x".repeat(40000) } },
+    { id: "null", value: null },
+    { id: "false", value: false },
+    { id: "zero", value: 0 },
+    { id: "empty", value: "" },
+    { id: "boundary", value: "x".repeat(65530) },
+    { id: "large", value: "🦊".repeat(20000) },
+    { id: "symlink", value: undefined },
+    { id: "directory", value: undefined },
+    { id: "missing", value: undefined },
+    { id: "corrupt", value: undefined },
+    { id: "failed", value: { pass: false } },
+  ];
+  for (const item of cases) {
+    const store = new RunStore(cwd, sessionId, item.id, home);
+    await store.create({ id: item.id, workflowName: item.id, cwd, sessionId, state: item.id === "failed" ? "failed" : "completed", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return null;", args: null, metadata: { name: item.id }, settings: { concurrency: 1 }, models: [], tools: [], agentConfigurations: {}, schemas: [] }));
+    if (item.value !== undefined) await store.saveResult(item.value);
+    if (item.id === "corrupt") writeFileSync(join(store.directory, "result.json"), "{invalid");
+    if (item.id === "symlink") symlinkSync(join(home, "private.json"), join(store.directory, "result.json"));
+    if (item.id === "directory") mkdirSync(join(store.directory, "result.json"));
+  }
+  writeFileSync(join(home, "private.json"), '{"secret":true}');
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    let json = "";
+    assert.equal(await runCli(["inspect", sessionId, "--json"], { cwd, isTTY: false }, (text) => { json += text; }), 0);
+    const parsed = JSON.parse(json) as { runs: Array<{ runId: string; state: string; result?: { status: string; value?: unknown; preview?: string; previewBytes?: number; totalBytes?: number } }> };
+    for (const item of cases.slice(0, 6)) {
+      assert.deepEqual(parsed.runs.find((run) => run.runId === item.id)?.result, { status: "available", value: item.value });
+    }
+    const large = parsed.runs.find((run) => run.runId === "large")?.result;
+    assert.equal(large?.status, "truncated");
+    assert.ok(large.preview?.startsWith('"🦊'));
+    assert.equal(large.previewBytes, 4096);
+    assert.ok((large.totalBytes ?? 0) > 65536);
+    assert.ok(Buffer.byteLength(large.preview ?? "") <= 4096);
+    assert.doesNotMatch(large.preview ?? "", /\uFFFD/);
+    for (const id of ["symlink", "directory"]) assert.deepEqual(parsed.runs.find((run) => run.runId === id)?.result, { status: "unavailable" });
+    assert.doesNotMatch(json, /secret/);
+    assert.equal(parsed.runs.find((run) => run.runId === "missing")?.result, undefined);
+    assert.deepEqual(parsed.runs.find((run) => run.runId === "corrupt")?.result, { status: "unavailable" });
+    assert.equal(parsed.runs.find((run) => run.runId === "failed")?.result, undefined);
+    assert.equal(parsed.runs.find((run) => run.runId === "business")?.state, "completed");
+    let summary = "";
+    assert.equal(await runCli(["inspect", sessionId, "--summary"], { cwd, isTTY: false }, (text) => { summary += text; }), 0);
+    assert.match(summary, /business completed .*result=available/);
+    assert.match(summary, /large completed .*result=truncated/);
+    assert.doesNotMatch(summary, /review-failed/);
+    let failed = "";
+    assert.equal(await runCli(["inspect", sessionId, "--json", "--failed"], { cwd, isTTY: false }, (text) => { failed += text; }), 0);
+    assert.deepEqual((JSON.parse(failed) as { runs: Array<{ runId: string }> }).runs.map((run) => run.runId), ["failed"]);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
+
 void test("filters persisted inspection to failed runs", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-inspect-failed-"));
   const cwd = join(home, "project");
