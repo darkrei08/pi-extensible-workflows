@@ -19,7 +19,6 @@ import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIf
 import { agentHandleTurnPath, agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath, toolIdentityPath } from "./execution.js";
 import { prepareScriptToolLoadout, scriptTool, scriptToolContext, scriptToolValue, validateScriptToolReferences } from "./script-tools.js";
 import backgroundWidget, { type AgentsOpener, type BackgroundSubagent, type BackgroundWidgetAPI } from "./background-widget.js";
-import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, trajectoryRunUsage, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
@@ -1246,7 +1245,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     if (sessionStarted) return;
     sessionStarted = true;
     try {
-    await showChangelogNotice(ctx, extensionAgentDir);
     releaseWorkflowRegistry = retainWorkflowRegistry();
     registry.freeze();
     registerCatalog(ctx.cwd, projectTrusted(ctx));

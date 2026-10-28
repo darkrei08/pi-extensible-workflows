@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Breaking changes
+
+- The extension no longer shows its own release notes notice at startup. Pi versions with earendil-works/pi#8790 show the package `CHANGELOG.md` under "Extension Updates" after an update of an npm or git install; older Pi versions, RPC mode, and extensions loaded by path show no release notes. `<agentDir>/pi-extensible-workflows/changelog-state.json` is no longer read or written and can be deleted.
+
 ### Fixes
 
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
