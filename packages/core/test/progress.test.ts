@@ -266,13 +266,19 @@ void test("workflow progress nests active shell under its phase occurrence", () 
   assert.match(progress, /\[Phase: verify\]\n\s{4}◇ shell \[running\] \(1 active\)/);
   assert.doesNotMatch(progress, /\n\s{2}◇ shell \[running\]/);
 });
-void test("collapsed workflow progress hides finished phases that ran no agents and have no live shell", () => {
-  const phaseHistory = [{ phase: "review", afterAgent: 0 }, { phase: "gates", afterAgent: 1 }, { phase: "merge", afterAgent: 1 }, { phase: "probe", afterAgent: 1 }, { phase: "pin", afterAgent: 2 }];
+void test("collapsed workflow progress lists finished phases that ran no agents while they fit, else merges consecutive ones into one line", () => {
+  const phaseHistory = [{ phase: "review", afterAgent: 0, startedAt: 0 }, { phase: "gates", afterAgent: 1, startedAt: 1_000 }, { phase: "lint", afterAgent: 1, startedAt: 3_000 }, { phase: "merge", afterAgent: 1, startedAt: 6_000 }, { phase: "probe", afterAgent: 1, startedAt: 7_000 }, { phase: "pin", afterAgent: 2, startedAt: 8_000 }];
   const agents = [makeAgent({ id: "run:1", name: "review", path: "run:1", state: "completed" }), makeAgent({ id: "run:2", name: "probe", path: "run:2", state: "completed" })];
-  const run = makeRun({ workflowName: "queue", phase: "pin", phaseHistory, agents, activeShellsByPhase: [{ phaseIndex: 2, active: 1, startedAt: 0 }] });
-  const phases = (expanded: boolean) => formatWorkflowProgress(run, "◇", undefined, 65_432, expanded).split("\n").filter((line) => line.includes("[Phase: ")).map((line) => line.trim());
-  assert.deepEqual(phases(false), ["[Phase: review]", "[Phase: merge]", "[Phase: probe]", "[Phase: pin]"]);
-  assert.deepEqual(phases(true), ["[Phase: review]", "[Phase: gates]", "[Phase: merge]", "[Phase: probe]", "[Phase: pin]"]);
+  const run = makeRun({ workflowName: "queue", phase: "pin", phaseHistory, agents, activeShellsByPhase: [{ phaseIndex: 3, active: 1, startedAt: 0 }] });
+  const phases = (expanded: boolean, maxLines?: number) => formatWorkflowProgress(run, "◇", undefined, 65_432, expanded, undefined, false, maxLines).split("\n").filter((line) => /\[(Phase: |\d+ phases: )/.test(line)).map((line) => line.trim().replace(/\].*$/, "]"));
+  const all = ["[Phase: review]", "[Phase: gates]", "[Phase: lint]", "[Phase: merge]", "[Phase: probe]", "[Phase: pin]"];
+  const merged = ["[Phase: review]", "[2 phases: gates … lint]", "[Phase: merge]", "[Phase: probe]", "[Phase: pin]"];
+  assert.deepEqual(phases(false), merged);
+  assert.match(formatWorkflowProgress(run, "◇", undefined, 65_432), /\[2 phases: gates … lint\] 5s/);
+  assert.deepEqual(phases(false, 40), all);
+  const fullHeight = formatWorkflowProgress(run, "◇", undefined, 65_432, false, undefined, false, 40).split("\n").length;
+  assert.deepEqual(phases(false, fullHeight - 1), merged);
+  assert.deepEqual(phases(true), all);
 });
 void test("navigator keeps agent rows compact while preserving identity and state", () => {
   const run = makeRun({ workflowName: "policy", agents: [makeAgent({ id: "run:1", name: "review", path: "run:1", model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read", "grep"] })] });

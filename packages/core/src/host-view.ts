@@ -146,8 +146,8 @@ function phaseDuration(run: PersistedRun, phases: readonly WorkflowPhaseRecord[]
   if (run.state === "running") return Math.max(0, now - start);
   return agents.length ? Math.max(0, Math.max(...agents.map(agentEnd)) - start) : undefined;
 }
-/** What a height-limited render gives up: `shown` compacts the current phase's agents, `summarized` closed segments (oldest first, the agents before the first phase counting as one) keep only their summary and failures, `folded` phases merge into one line, and `logTail` caps the log lines. */
-interface ProgressFit { shown?: ReadonlySet<AgentRecord>; summarized?: number; folded?: number; logTail?: number }
+/** What a height-limited render gives up: `shown` compacts the current phase's agents, `summarized` closed segments (oldest first, the agents before the first phase counting as one) keep only their summary and failures, `folded` phases merge into one line, and `logTail` caps the log lines. `emptyPhases` keeps finished phases that ran no agents in the compact view. */
+interface ProgressFit { shown?: ReadonlySet<AgentRecord>; summarized?: number; folded?: number; logTail?: number; emptyPhases?: boolean }
 /** Smallest value in [low, high] that `fits`, or `high` when none does; `fits` must be monotonic. */
 function smallestFitting(low: number, high: number, fits: (value: number) => boolean): number {
   while (low < high) { const middle = Math.floor((low + high) / 2); if (fits(middle)) high = middle; else low = middle + 1; }
@@ -160,6 +160,11 @@ function smallestFitting(low: number, high: number, fits: (value: number) => boo
  * scrollback on every update, which snaps the reader back to the bottom.
  */
 export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES, now = Date.now(), expanded = false, width?: number, showHint = false, maxLines?: number): string {
+  // With a known height, the compact view lists finished phases that ran no agents while they fit, and gives them up first.
+  if (!expanded && maxLines !== undefined) {
+    const withEmptyPhases = workflowProgressLines(run, spinner, styles, now, false, width, showHint, { emptyPhases: true });
+    if (withEmptyPhases.length <= maxLines) return withEmptyPhases.join("\n");
+  }
   const full = workflowProgressLines(run, spinner, styles, now, expanded, width, showHint);
   if (maxLines === undefined || full.length <= maxLines) return full.join("\n");
   const phases = run.phaseHistory?.length ? run.phaseHistory : run.phase ? [{ phase: run.phase, afterAgent: 0 }] : [];
@@ -193,7 +198,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", style
   return render(foldedAgents, smallestFitting(0, closed, (folded) => render(foldedAgents, folded).length <= maxLines)).join("\n");
 }
 function workflowProgressLines(run: PersistedRun, spinner: string, styles: WorkflowProgressStyles, now: number, expanded: boolean, width: number | undefined, showHint: boolean, fit: ProgressFit = {}): string[] {
-  const { shown, summarized = 0, folded = 0 } = fit;
+  const { shown, summarized = 0, folded = 0, emptyPhases = false } = fit;
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const workflowIcon = runStateGlyph(run.state, spinner);
   const iconStyle = workflowIconStyle(run.state, styles);
@@ -248,11 +253,21 @@ function workflowProgressLines(run: PersistedRun, spinner: string, styles: Workf
     renderedAgents = foldBoundary;
     nested = true;
   }
+  // Consecutive finished phases that ran no agents share one line in the compact view.
+  let empty: { first: string; last: string; count: number; duration: number } | undefined;
+  const flushEmpty = () => {
+    if (!empty) return;
+    const label = empty.count === 1 ? `[Phase: ${empty.first}]` : `[${String(empty.count)} phases: ${empty.first} … ${empty.last}]`;
+    lines.push(`  ${styles.muted(label)}${empty.duration > 0 ? ` ${styles.muted(formatWorkflowRuntime(empty.duration))}` : ""}`);
+    empty = undefined;
+    nested = true;
+  };
   for (const [phaseIndex, phase] of phases.entries()) {
     if (phaseIndex < folded) continue;
     const boundary = Math.max(renderedAgents, Math.min(run.agents.length, phase.afterAgent));
     const before = run.agents.slice(renderedAgents, boundary);
     const beforeCollapsed = Boolean(shown) || phaseIndex < summarized;
+    if (before.length) flushEmpty();
     if (beforeCollapsed && !nested && before.length) lines.push(`  ${phaseSummary(before, styles)}`);
     lines.push(...segment(before, beforeCollapsed));
     const next = phases[phaseIndex + 1];
@@ -260,9 +275,13 @@ function workflowProgressLines(run: PersistedRun, spinner: string, styles: Workf
     const phaseShell = scopedShells ? shellActivityFor(run, phaseIndex) : undefined;
     const shellLine = phaseShell ? formatShellActivity(phaseShell.active, phaseShell.startedAt, spinner, styles, now) : undefined;
     renderedAgents = boundary;
-    // Outside the expanded view, a finished phase that ran no agents and has no live shell has nothing to show.
-    if (!expanded && next && !phaseAgents.length && !shellLine) continue;
     const duration = phaseDuration(run, phases, phaseIndex, phaseAgents, now);
+    // Outside the expanded view, finished phases that ran no agents and have no live shell get their own line only while they fit.
+    if (!expanded && !emptyPhases && next && !phaseAgents.length && !shellLine) {
+      empty = empty ? { ...empty, last: phase.phase, count: empty.count + 1, duration: empty.duration + (duration ?? 0) } : { first: phase.phase, last: phase.phase, count: 1, duration: duration ?? 0 };
+      continue;
+    }
+    flushEmpty();
     const summary = next && (shown || phaseIndex + 1 < summarized) ? phaseSummary(phaseAgents, styles, duration) : duration === undefined ? "" : styles.muted(formatWorkflowRuntime(duration));
     lines.push(`  ${styles.muted(`[Phase: ${phase.phase}]`)}${summary ? ` ${summary}` : ""}`);
     if (shellLine) lines.push(`    ${shellLine}`);
