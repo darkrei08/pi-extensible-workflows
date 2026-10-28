@@ -62,7 +62,12 @@ void test("explicit-role policy delegates valid and unknown names without changi
   assert.equal(prepared.systemPromptAppend, "review instructions");
   const replay = new WorkflowAgentExecutor({ ...root, agentPreparationHooks: registry.agentPreparationHooks().map((hook) => ({ ...hook, prepare() { throw new Error("frozen role resolution must not rerun"); } })) }, transport);
   assert.deepEqual(await replay.prepare({ ...options({ role: "reviewer", model: "removed-alias" }), configuration: prepared }), prepared);
-  await assert.rejects(replay.prepare({ ...options({}), configuration: prepared }), /explicit.*role.*required/i);
+  assert.deepEqual(await replay.prepare({ ...options({}), configuration: prepared }), prepared);
+  const store = new RunStore(root.cwd, "session", "run", root.cwd);
+  await store.create({ id: "run", workflowName: "test", cwd: root.cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return null", args: null, metadata: { name: "test" }, settings: { concurrency: 1 }, models: ["test/model"], tools: ["read"], schemas: [], agentConfigurations: {} }));
+  await store.saveAgentConfiguration("stored", prepared);
+  const storedReplay = new WorkflowAgentExecutor({ ...root, runStore: store, agentPreparationHooks: registry.agentPreparationHooks().map((hook) => ({ ...hook, prepare() { throw new Error("stored role resolution must not rerun"); } })) }, transport);
+  assert.deepEqual(await storedReplay.prepare({ ...options({}), agentNodeId: "stored" }), prepared);
   await assert.rejects(executor.prepare({ ...options({}), parent: "parent", inheritedExtensionSettings: { workflow: { requireExplicitRole: false } } }), /explicit.*role.*required/i);
 });
 void test("absent and disabled explicit-role policy preserve opaque role-less preparation", async (t) => {
