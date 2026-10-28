@@ -136,10 +136,9 @@ async function withChrome(url: string, signal: AbortSignal, callback: (page: Dev
   let page: Devtools | undefined;
   try {
     page = await connectDevtools(await waitForDevtools(child, () => stderr.join("")));
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if (await page.evaluate("document.readyState === 'complete'")) break;
-      await delay(25);
-    }
+    // The listed page target can still be the initial about:blank, so load the requested URL explicitly.
+    await page.command("Page.navigate", { url });
+    await waitFor(page, `location.href === ${JSON.stringify(new URL(url).href)} && document.readyState === 'complete'`);
     await callback(page);
   } finally {
     signal.removeEventListener("abort", killOnAbort);
