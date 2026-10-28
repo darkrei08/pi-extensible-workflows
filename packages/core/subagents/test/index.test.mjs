@@ -718,6 +718,8 @@ test("exposes extensible run options and closed control schemas and minimal prom
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.required, ["prompt"]);
   assert.equal(SUBAGENTS_RUN_PARAMETERS.additionalProperties, true);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.properties.mode.anyOf.map(({ const: value }) => value), ["background", "foreground"]);
+  const runTool = createSubagentTools({ async run() {}, async inspect() {}, async steer() {}, async stop() {}, async retry() {} }).find(({ name }) => name === "subagents_run");
+  assert.match(runTool.description, /Extensions may accept extra options; their usage is described in the system prompt\.$/);
 
   assert.deepEqual(Object.keys(SUBAGENTS_INSPECT_PARAMETERS.properties), ["id", "scope"]);
   assert.equal(SUBAGENTS_INSPECT_PARAMETERS.additionalProperties, false);

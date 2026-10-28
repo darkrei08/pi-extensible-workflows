@@ -77,7 +77,7 @@ export function createSubagentTools(manager: SubagentManager): readonly ToolDefi
     defineTool({
       name: "subagents_run",
       label: "Subagents Run",
-      description: "Start a durable subagent run. Background mode returns its ID immediately; foreground mode waits and returns the terminal value or error in this tool call. Use the ID with subagents_inspect, subagents_steer, subagents_stop, or subagents_retry.",
+      description: "Start a durable subagent run. Background mode returns its ID immediately; foreground mode waits and returns the terminal value or error in this tool call. Use the ID with subagents_inspect, subagents_steer, subagents_stop, or subagents_retry. Extensions may accept extra options; their usage is described in the system prompt.",
       promptSnippet: "Run durable subagents in background by default; inspect, steer, stop, or retry them with the other subagents tools.",
       promptGuidelines: [
         "Runs are background by default; choose mode: \"foreground\" only when the terminal envelope is needed in this turn.",

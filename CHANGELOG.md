@@ -4,6 +4,7 @@
 ### Fixes
 
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
+- The `subagents_run` tool description now tells the model that extensions may accept extra options and that their usage is described in the system prompt, so extension-owned options outside the core schema are discoverable (#368).
 
 ## [6.3.0] - 2026-10-25
 
