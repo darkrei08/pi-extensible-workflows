@@ -217,14 +217,39 @@ void test("foreground setup failure leaves a live delivery attached", async () =
   }
 });
 
-void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async () => {
+void test("checkpoint keeps boolean semantics and supports opt-in response details", async () => {
   const accepted: unknown[] = [];
-  assert.equal(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, "rejected");
+  const response = { approved: false, choice: "manual", feedback: "needs tests" } as const;
+  assert.equal(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return response; } }).result, "rejected");
   assert.deepEqual(accepted, [{ name: "ship", prompt: "Ship?", context: { sha: "abc" } }]);
+  assert.deepEqual(await runWorkflow(`export const meta={name:'details',description:'details'}; return checkpointDetails({name:'ship',prompt:'Ship?',context:null});`, null, { checkpoint(input) { assert.equal(input.details, true); return response; } }).result, response);
+  assert.deepEqual(validateCheckpoint({ name: "x", prompt: "ok", context: null, choices: ["canary", "blue"], details: true }), { name: "x", prompt: "ok", context: null, choices: ["canary", "blue"], details: true });
   assert.throws(() => validateCheckpoint({ name: "x", prompt: "😀".repeat(257), context: null }), /1024/);
   assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: "😀".repeat(1025) }), /4096/);
-  assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: null, default: true }), /only name/);
+  assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: null, default: true }), /only name, prompt, context, choices, and details/);
+  assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: null, choices: [] }), /choices/);
   for (const value of [null, "checkpoint", { name: "x", prompt: "ok" }, { name: "", prompt: "ok", context: null }]) assert.throws(() => validateCheckpoint(value), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+});
+
+void test("checkpoint resume replays legacy booleans and validates structured answers", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-replay-"));
+  const snapshot = createLaunchSnapshot({ script: "return null", args: null, metadata: { name: "checkpoint-replay" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
+  const legacy = new RunStore(home, "session", "legacy", home);
+  await legacy.create({ id: "legacy", workflowName: "checkpoint-replay", cwd: home, sessionId: "session", state: "awaiting_input", agents: [], agentSessions: [] }, snapshot);
+  const legacyCheckpoint = { path: "checkpoint/legacy", name: "legacy", prompt: "Continue?", context: null };
+  await legacy.awaitCheckpoint(legacyCheckpoint);
+  await legacy.answerCheckpoint("legacy", false);
+  assert.equal(await legacy.awaitCheckpoint(legacyCheckpoint), false);
+
+  const current = new RunStore(home, "session", "current", home);
+  await current.create({ id: "current", workflowName: "checkpoint-replay", cwd: home, sessionId: "session", state: "awaiting_input", agents: [], agentSessions: [] }, snapshot);
+  const currentCheckpoint = { path: "checkpoint/current", name: "current", prompt: "Deploy?", context: null, choices: ["canary", "blue"] };
+  await current.awaitCheckpoint(currentCheckpoint);
+  await assert.rejects(current.answerCheckpoint("current", true, "green"), /choice/);
+  await assert.rejects(current.answerCheckpoint("current", true, "canary", "x".repeat(4097)), /feedback/);
+  assert.equal((await current.awaitingCheckpoints()).length, 1);
+  await current.answerCheckpoint("current", true, "canary", "safe rollout");
+  assert.deepEqual(await current.awaitCheckpoint(currentCheckpoint), { approved: true, choice: "canary", feedback: "safe rollout" });
 });
 
 void test("production checkpoints resolve in foreground navigator and background tool paths", async () => {
@@ -589,7 +614,7 @@ void test("workflow_respond accepts optional choice and feedback and resolves ch
   assert.ok(workflow && respond);
 
   const base = { cwd: home, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } };
-  const script = `export const meta={name:'structured-gate',description:'gate'}; return checkpoint({name:'deploy',prompt:'Deploy?',context:{env:'prod'}});`;
+  const script = `export const meta={name:'structured-gate',description:'gate'}; return checkpointDetails({name:'deploy',prompt:'Deploy?',context:{env:'prod'},choices:['canary','blue']});`;
 
   const background = await workflow.execute("id", { name: "structured-gate", script }, new AbortController().signal, undefined, base) as { details: { runId: string } };
   const { runId } = background.details;

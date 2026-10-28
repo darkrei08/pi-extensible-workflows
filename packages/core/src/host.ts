@@ -31,7 +31,7 @@ import { openAgentsWorkspace, type OpenAgentsWorkspace } from "./agents-workspac
 import { createSessionAgentsSource, type SessionAgentsScope } from "./session-agents.js";
 import { openSessionTranscript } from "./session-transcript.js";
 import { createTranscriptView } from "./transcript-components.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type CheckpointResponseDetails, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { CHECKPOINT_MAX_CHOICE_BYTES, CHECKPOINT_MAX_FEEDBACK_BYTES, HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type CheckpointResponseDetails, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
 import { DELIVERY_LIMIT_BYTES, ForegroundDeliveryController, markWorkflowFailureDiagnostics, WORKFLOW_LOG_ENTRY, completionDescriptor, completionDeliveryFromStore, createWorkflowFailureDiagnostics, failureDiagnosticsFrom, formatWorkflowFailure, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, formatWorkflowFailureDiagnostics, isWorkflowFailureDiagnostics, serializeWorkflowFailureDiagnostics, utf8Prefix, type CompletionDeliveryContext, type ForegroundDelivery, type ForegroundDetachResult, type WorkflowLogEntry } from "./host-delivery.js";
@@ -928,24 +928,27 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     return true;
   };
   const backgroundCheckpointDeliveries = new Set<string>();
-  const deliverBackgroundCheckpoint = (workflowName: string, runId: string, checkpoint: { path: string; name: string; prompt: string; context: JsonValue }): void => {
+  const deliverBackgroundCheckpoint = (workflowName: string, runId: string, checkpoint: { path: string; name: string; prompt: string; context: JsonValue; choices?: readonly string[] }): void => {
     const key = `${runId}:${checkpoint.path}`;
     if (backgroundCheckpointDeliveries.has(key)) return;
     backgroundCheckpointDeliveries.add(key);
-    deliver(pi, `Workflow ${workflowName} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`, !shuttingDown);
+    const choices = checkpoint.choices === undefined ? "" : `\nChoices: ${checkpoint.choices.join(", ")}`;
+    deliver(pi, `Workflow ${workflowName} checkpoint ${checkpoint.name}: ${checkpoint.prompt}${choices}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`, !shuttingDown);
   };
   const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean | (() => boolean), ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless = false) => {
     const checkpointCounters = new Map<string, number>();
     const isForeground = () => typeof foreground === "function" ? foreground() : foreground;
     return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean | CheckpointResponseDetails> => {
-      const input = validateCheckpoint(raw);
+      const { details = false, ...input } = validateCheckpoint(raw);
+      const toDetails = (result: boolean | CheckpointResponseDetails): CheckpointResponseDetails => typeof result === "boolean" ? { approved: result } : result;
+      const toBoolean = (result: boolean | CheckpointResponseDetails): boolean => typeof result === "boolean" ? result : result.approved;
       const label = nextNamedOccurrence(checkpointCounters, input.name);
       const path = operationPath("checkpoint", label);
       if (headless) fail("RESUME_INCOMPATIBLE", "Headless CLI checkpoints are unsupported");
       if (isForeground() && !ui?.select) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
       const alreadyAwaiting = (await store.awaitingCheckpoints()).some((checkpoint) => checkpoint.path === path);
       const replayed = await store.awaitCheckpoint({ ...input, name: label, path });
-      if (replayed !== undefined) return replayed;
+      if (replayed !== undefined) return details ? toDetails(replayed) : toBoolean(replayed);
       if (!alreadyAwaiting) await eventPublisher.checkpoint(store, metadata, label, "awaiting");
       const run = runs.get(runId);
       await run?.lifecycle.enterAwaitingInput();
@@ -974,7 +977,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         if (!isForeground() && !signal.aborted && run?.checkpointResolvers.has(path)) deliverBackgroundCheckpoint(metadata.name, runId, { ...input, name: label, path });
       //NOTE: background checkpoint-UI poll loop; swallow so a transient render error stops polling silently instead of surfacing as an unhandled rejection — the pending checkpoint resolves via the normal delivery path below.
       })().catch(() => undefined);
-      return decision;
+      const result = await decision;
+      return details ? toDetails(result) : toBoolean(result);
     };
   };
   const registerControlTool = <P extends TSchema>(
@@ -1014,8 +1018,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       name: Type.Optional(Type.String()),
       proposalId: Type.Optional(Type.String()),
       approved: Type.Boolean(),
-      choice: Type.Optional(Type.String({ description: "Optional specific choice key or disposition" })),
-      feedback: Type.Optional(Type.String({ description: "Optional explanation or review feedback" })),
+      choice: Type.Optional(Type.String({ maxLength: CHECKPOINT_MAX_CHOICE_BYTES, description: "Optional specific choice key or disposition" })),
+      feedback: Type.Optional(Type.String({ maxLength: CHECKPOINT_MAX_FEEDBACK_BYTES, description: "Optional explanation or review feedback" })),
     }, { additionalProperties: false }),
     WORKFLOW_RESPOND_OUTPUT,
     async (params, signal, ctx) => {

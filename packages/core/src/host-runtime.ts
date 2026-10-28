@@ -415,7 +415,14 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
       withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>) => hostWithWorktree(name, callback, bridge.worktree, signal),
       checkpoint: async (...args: readonly unknown[]) => {
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
-        return bridge.checkpoint(args[0], signal);
+        const result = await bridge.checkpoint(args[0], signal);
+        return typeof result === "boolean" ? result : result.approved;
+      },
+      checkpointDetails: async (...args: readonly unknown[]) => {
+        if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
+        const input = { ...(args[0] as Readonly<Record<string, JsonValue>>), details: true };
+        const result = await bridge.checkpoint(input, signal);
+        return typeof result === "boolean" ? { approved: result } : result;
       },
       phase: (name: string) => { ownSideEffect(() => bridge.phase?.(name)); },
       log: (message: string) => { ownSideEffect(() => bridge.log?.(message)); },

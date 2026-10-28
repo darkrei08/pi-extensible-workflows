@@ -186,7 +186,7 @@ export class WorkflowRegistry {
       if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${name}`);
       return structuredClone(replayed);
     }
-    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, settings: deepFreeze(structuredClone(context.settings)), invoke: context.invoke, agent: context.agent, shell: context.shell, tools: context.tools, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log, ...(context.evidence ? { evidence: context.evidence } : {}) }));
+    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, settings: deepFreeze(structuredClone(context.settings)), invoke: context.invoke, agent: context.agent, shell: context.shell, tools: context.tools, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, checkpointDetails: context.checkpointDetails, phase: context.phase, log: context.log, ...(context.evidence ? { evidence: context.evidence } : {}) }));
     if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);

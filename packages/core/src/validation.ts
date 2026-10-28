@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as acorn from "acorn";
 import { Script } from "node:vm";
-import type { CheckpointInput, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
+import { CHECKPOINT_MAX_CHOICE_BYTES, CHECKPOINT_MAX_CHOICES, type JsonSchema, type JsonValue, type PreflightCapabilities, type PreflightResult, type ShellOptions, type StaticWorkflowCall, type StaticWorkflowExecution, type StaticWorkflowScope, type ValidatedCheckpointInput, type ValidatedWorkflowLaunch, type WorkflowCallKind, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowValidationContext, type WorkflowValidationParameters } from "./types.js";
 import type { WorkflowRegistryApi } from "./registry.js";
 import { assertModelThinking, validateSchema, deepFreeze, errorText, fail, jsonObject, jsonValue, object, positiveInteger, resourcePatternHasMagic } from "./utils.js";
 import { WORKFLOW_CALL_KINDS } from "./types.js";
@@ -11,11 +11,15 @@ export { validateSchema } from "./utils.js";
 import { validateContextFileScopes, validateSelectorList } from "./settings.js";
 export { DEFAULT_SETTINGS, loadCodemodeToolsSetting, loadSettings, loadSettingsOverrides, resolveAgentResourcePolicy, resolveWorkflowSettings, saveModelAliases, validateContextFileScopes, validateModelAliasAvailability, validateSelectorList, validateWorkflowExtensionSettings, workflowProjectSettingsPath, workflowSettingsPath, workflowToolExposure } from "./settings.js";
 
-export function validateCheckpoint(value: unknown): CheckpointInput {
-  if (!object(value) || Object.keys(value).some((key) => !["name", "prompt", "context"].includes(key)) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.prompt !== "string" || !jsonValue(value.context)) fail("INVALID_METADATA", "checkpoint requires only name, prompt, and JSON context");
+export function validateCheckpoint(value: unknown): ValidatedCheckpointInput {
+  if (!object(value) || Object.keys(value).some((key) => !["name", "prompt", "context", "choices", "details"].includes(key)) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.prompt !== "string" || !jsonValue(value.context)) fail("INVALID_METADATA", "checkpoint requires only name, prompt, context, choices, and details");
   if (Buffer.byteLength(value.prompt) > 1024) fail("INVALID_METADATA", "checkpoint prompt exceeds 1024 UTF-8 bytes");
   if (Buffer.byteLength(JSON.stringify(value.context)) > 4096) fail("INVALID_METADATA", "checkpoint context exceeds 4096 UTF-8 bytes");
-  return { name: value.name, prompt: value.prompt, context: value.context };
+  if (value.details !== undefined && typeof value.details !== "boolean") fail("INVALID_METADATA", "checkpoint details must be boolean");
+  const rawChoices: unknown = value.choices;
+  if (rawChoices !== undefined && (!Array.isArray(rawChoices) || rawChoices.length === 0 || rawChoices.length > CHECKPOINT_MAX_CHOICES || rawChoices.some((choice: unknown) => typeof choice !== "string" || choice.trim() === "" || Buffer.byteLength(choice) > CHECKPOINT_MAX_CHOICE_BYTES))) fail("INVALID_METADATA", "checkpoint choices must contain 1-16 non-empty strings of at most 128 UTF-8 bytes");
+  const choices = rawChoices === undefined ? undefined : rawChoices as string[];
+  return { name: value.name, prompt: value.prompt, context: value.context, ...(choices === undefined ? {} : { choices: [...choices] }), ...(value.details === undefined ? {} : { details: value.details }) };
 }
 
 function validateWorkflowMetadata(value: unknown): WorkflowMetadata {

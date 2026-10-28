@@ -47,8 +47,10 @@ const typeCheckAgentContext = (context: WorkflowOrchestrationContext): void => {
   void worktreeResult;
   const parallelResult: Promise<{ first: Static<typeof outputSchema>; second: number }> = context.parallel("batch", { first: () => context.agent("prompt", { outputSchema }), second: () => 2 });
   void parallelResult;
-  const checkpointResult: Promise<boolean | CheckpointResponseDetails> = context.checkpoint({ name: "ship", prompt: "Approve shipment", context: { artifact: "build" } });
+  const checkpointResult: Promise<boolean> = context.checkpoint({ name: "ship", prompt: "Approve shipment", context: { artifact: "build" } });
+  const checkpointDetails: Promise<CheckpointResponseDetails> = context.checkpointDetails({ name: "ship", prompt: "Approve shipment", context: { artifact: "build" } });
   void checkpointResult;
+  void checkpointDetails;
   // @ts-expect-error checkpoint requires a CheckpointInput
   void context.checkpoint("ship");
   // @ts-expect-error checkpoint context must be JSON-compatible

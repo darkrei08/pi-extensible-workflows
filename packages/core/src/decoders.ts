@@ -1,4 +1,4 @@
-import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type CheckpointResponseDetails, type PreparedAgentConfiguration, LAUNCH_SNAPSHOT_IDENTITY_VERSION, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, CHECKPOINT_MAX_CHOICE_BYTES, CHECKPOINT_MAX_CHOICES, CHECKPOINT_MAX_FEEDBACK_BYTES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type CheckpointResponseDetails, type PreparedAgentConfiguration, LAUNCH_SNAPSHOT_IDENTITY_VERSION, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import { validAgentSpeed } from "./agent-speed.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
@@ -10,7 +10,7 @@ export interface RunSummaryArtifacts { runDirectory: string; statePath: string; 
 export interface EvidenceRecord { ref: string; sha256: string; path: string; bytes: number }
 export interface RunSummary { schemaVersion: 1; runId: string; sessionId: string; workflowName: string; state: RunRecord["state"]; createdAt: string; updatedAt: string; terminalAt?: string; usage: WorkflowBudgetUsage; agents: readonly RunSummaryAgent[]; error?: RunRecord["error"]; failedAt?: string; replayablePaths: readonly string[]; incompletePaths: readonly string[]; artifacts: RunSummaryArtifacts }
 export interface CompletedOperation { path: string; value: JsonValue }
-export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
+export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue; choices?: readonly string[] }
 export type PendingWorkflowDecision = BudgetApprovalRequest
 export type PersistedOwnershipNode = OwnershipRecord
 export type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint>; decisions?: Record<string, PendingWorkflowDecision> };
@@ -537,7 +537,9 @@ function decodeAwaitingCheckpoint(value: unknown): AwaitingCheckpoint | undefine
   if (!object(value) || typeof value.path !== "string" || typeof value.name !== "string" || typeof value.prompt !== "string") return undefined;
   const context = decodeJsonValue(value.context);
   if (context === undefined) return undefined;
-  return { path: value.path, name: value.name, prompt: value.prompt, context };
+  const choices = value.choices === undefined ? undefined : decodeArray(value.choices, (choice) => typeof choice === "string" && Buffer.byteLength(choice) <= CHECKPOINT_MAX_CHOICE_BYTES ? choice : undefined);
+  if (value.choices !== undefined && (!choices || choices.length === 0 || choices.length > CHECKPOINT_MAX_CHOICES)) return undefined;
+  return { path: value.path, name: value.name, prompt: value.prompt, context, ...(choices === undefined ? {} : { choices }) };
 }
 function decodePendingWorkflowDecision(value: unknown): PendingWorkflowDecision | undefined {
   if (!object(value) || value.kind !== "budget" || typeof value.proposalId !== "string" || typeof value.runId !== "string" || !integer(value.budgetVersion)) return undefined;
@@ -559,6 +561,8 @@ export function decodeJournal(value: unknown): Journal | undefined {
 export function decodeCheckpointResult(value: unknown): boolean | CheckpointResponseDetails | undefined {
   if (typeof value === "boolean") return value;
   if (object(value) && typeof value.approved === "boolean") {
+    if (value.choice !== undefined && (typeof value.choice !== "string" || Buffer.byteLength(value.choice) > CHECKPOINT_MAX_CHOICE_BYTES)) return undefined;
+    if (value.feedback !== undefined && (typeof value.feedback !== "string" || Buffer.byteLength(value.feedback) > CHECKPOINT_MAX_FEEDBACK_BYTES)) return undefined;
     const choice = typeof value.choice === "string" ? value.choice : undefined;
     const feedback = typeof value.feedback === "string" ? value.feedback : undefined;
     return {

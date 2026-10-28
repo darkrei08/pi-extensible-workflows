@@ -292,6 +292,7 @@ const prompt = (template, values) => {
   return template.replace(/{{|}}|{([A-Za-z_$][\w$]*)}/g, (match, key) => match === "{{" ? "{" : match === "}}" ? "}" : typeof values[key] === "string" ? values[key] : JSON.stringify(values[key], null, 2));
 };
 const checkpoint = input => rpc("checkpoint", [input]).then(unwrap);
+const checkpointDetails = input => rpc("checkpoint", [{ ...input, details: true }]).then(unwrap);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
 const functionOccurrences = new Map();
@@ -386,7 +387,7 @@ const evidence = (...values) => {
   return guardedEvidenceResult(rpc("evidence", [values[0]]));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, tools, evidence, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, checkpointDetails, parallel, pipeline, phase, log, tools, evidence, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbox, name, { value: fn, writable: false, configurable: false });
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
@@ -663,7 +664,10 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         try {
           const result = await bridge.checkpoint(values[0], controller.signal);
           if (typeof result !== "boolean" && (!object(result) || typeof (result as Record<string, unknown>).approved !== "boolean")) fail("INTERNAL_ERROR", "checkpoint must return a boolean or approval object");
-          const resolved: JsonValue = typeof result === "boolean" ? (result ? "approved" : "rejected") : (result as unknown as JsonValue);
+          const details = values[0].details === true;
+          const approved = typeof result === "boolean" ? result : result.approved;
+          const response: JsonValue = typeof result === "boolean" ? { approved: result } : result as unknown as JsonValue;
+          const resolved: JsonValue = details ? response : approved ? "approved" : "rejected";
           value = branded({ name, ok: true, value: resolved });
         } catch (error) {
           const typed = asWorkflowError(error);

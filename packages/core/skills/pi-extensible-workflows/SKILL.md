@@ -22,6 +22,10 @@ return await agent(
 );
 ```
 
+## Checkpoint responses
+
+`checkpoint(input)` remains boolean, so existing scripts can keep using `if (await checkpoint(...))` safely. Use `checkpointDetails(input)` to opt into a `CheckpointResponseDetails` result with `approved`, optional `choice`, and optional `feedback` fields. Declare allowed response keys with `choices: ["canary", "blue"]`; `workflow_respond` rejects other choices. Choice values are limited to 128 UTF-8 bytes and feedback to 4096 UTF-8 bytes. Boolean and structured checkpoint journal entries are both replayable during retry and resume.
+
 ## Runtime and safety rules
 
 Functions returned by `workflow_catalog` are globals inside workflow source. You can compose them with other workflow operations by calling them in `script`; pass their inputs through `args` when appropriate:

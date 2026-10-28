@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { HARD_TERMINAL_RUN_STATES, WorkflowError, type CheckpointResponseDetails, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
+import { CHECKPOINT_MAX_CHOICE_BYTES, CHECKPOINT_MAX_FEEDBACK_BYTES, HARD_TERMINAL_RUN_STATES, WorkflowError, type CheckpointResponseDetails, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, jsonValue, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
 import {
@@ -403,6 +403,8 @@ export class RunStore {
     return this.updateJournal((journal) => {
       const checkpoint = Object.values(journal.awaiting ?? {}).find((item) => item.name === name);
       if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
+      if (choice !== undefined && (typeof choice !== "string" || Buffer.byteLength(choice) > CHECKPOINT_MAX_CHOICE_BYTES || checkpoint.choices !== undefined && !checkpoint.choices.includes(choice))) throw new WorkflowError("INVALID_METADATA", "checkpoint choice is not allowed");
+      if (feedback !== undefined && (typeof feedback !== "string" || Buffer.byteLength(feedback) > CHECKPOINT_MAX_FEEDBACK_BYTES)) throw new WorkflowError("INVALID_METADATA", "checkpoint feedback exceeds 4096 UTF-8 bytes");
       const value: JsonValue = (choice !== undefined || feedback !== undefined)
         ? { approved, ...(choice !== undefined ? { choice } : {}), ...(feedback !== undefined ? { feedback } : {}) }
         : approved;

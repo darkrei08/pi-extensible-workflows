@@ -184,7 +184,7 @@ void test("registers global functions and replays each call as one validated ope
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
-  const context = { settings: { acme: { enabled: true } }, run, tools: {}, invoke: async () => null, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { settings: { acme: { enabled: true } }, run, tools: {}, invoke: async () => null, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, checkpointDetails: async () => ({ approved: true }), phase: () => {}, log: () => {} };
   assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
   assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
@@ -194,7 +194,7 @@ void test("registers global functions and replays each call as one validated ope
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
   assert.deepEqual((receivedContext as { settings: unknown }).settings, { acme: { enabled: true } });
   assert.ok(Object.isFrozen((receivedContext as { settings: object }).settings));
-  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "settings", "shell", "tools", "withWorktree"]);
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "checkpointDetails", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "settings", "shell", "tools", "withWorktree"]);
   assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
 });
 void test("registered function context.invoke validates nested calls and replays completed children", async () => {
@@ -212,7 +212,7 @@ void test("registered function context.invoke validates nested calls and replays
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "composition" }), args: null, signal: new AbortController().signal });
   const parentPath = "function/outer/1";
   const occurrences = new Map<string, number>();
-  const context: WorkflowFunctionContext = { settings: {}, run, tools: {}, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context: WorkflowFunctionContext = { settings: {}, run, tools: {}, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, checkpointDetails: async () => ({ approved: true }), phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
   assert.equal(leafCalls, 1);
   occurrences.clear();
