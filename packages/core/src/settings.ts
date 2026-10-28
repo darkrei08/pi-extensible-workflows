@@ -90,6 +90,11 @@ export function validateWorkflowExtensionSettings(value: unknown, settingsPath: 
   return deepFreeze(normalized as WorkflowExtensionSettings);
 }
 function positiveRetentionInteger(value: unknown): value is number { return positiveInteger(value) && Number.isSafeInteger(value); }
+function validateWorktreeSetup(value: unknown, settingsPath: string): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((command) => typeof command !== "string" || !command.trim())) fail("INVALID_SETTINGS", `${settingsPath}.worktreeSetup must be an array of non-empty shell commands`);
+  return Object.freeze([...value as string[]]);
+}
 function validateRetention(value: unknown, settingsPath: string): Readonly<WorkflowRetentionSettings> | undefined {
   if (value === undefined) return undefined;
   const base = `${settingsPath}.retention`;
@@ -110,7 +115,7 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
     fail("CONFIG_ERROR", `Invalid workflow settings JSON at ${path}: ${errorText(error)}`);
   }
   if (!object(parsed)) fail("INVALID_SETTINGS", `Workflow settings at ${path} must be an object`);
-  const allowed = new Set(["concurrency", "modelAliases", "skills", "extensions", "extensionSettings", "tools", "retention", ...(partial ? [] : ["backgroundWidget", "codemodeTools"]) ]);
+  const allowed = new Set(["concurrency", "modelAliases", "skills", "extensions", "extensionSettings", "tools", "retention", "worktreeSetup", ...(partial ? [] : ["backgroundWidget", "codemodeTools"]) ]);
   const unknown = Object.keys(parsed).find((key) => !allowed.has(key));
   if (Object.prototype.hasOwnProperty.call(parsed, "disabledAgentResources")) fail("INVALID_SETTINGS", `disabledAgentResources is no longer supported; use skills, extensions, and tools selectors (settings: ${path})`);
   if (unknown) fail("INVALID_SETTINGS", `Unknown workflow setting at ${path}: ${unknown}`);
@@ -126,10 +131,11 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
   const extensions = validateSelectorList(parsed.extensions, path, "extensions");
   const extensionSettings = parsed.extensionSettings === undefined ? undefined : validateWorkflowExtensionSettings(parsed.extensionSettings, path, "INVALID_SETTINGS");
   const retention = validateRetention(parsed.retention, path);
+  const worktreeSetup = validateWorktreeSetup(parsed.worktreeSetup, path);
   return Object.freeze({
     ...(concurrency === undefined ? {} : { concurrency }), ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(codemodeTools === undefined ? {} : { codemodeTools }), ...(modelAliases === undefined ? {} : { modelAliases }),
     ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }),
-    ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(tools === undefined ? {} : { tools }), ...(retention === undefined ? {} : { retention }),
+    ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(tools === undefined ? {} : { tools }), ...(retention === undefined ? {} : { retention }), ...(worktreeSetup === undefined ? {} : { worktreeSetup }),
   });
 }
 export function loadSettings(path = workflowSettingsPath()): Readonly<WorkflowSettings> { return parseSettings(path, false); }
@@ -163,7 +169,7 @@ export function resolveWorkflowSettings(cwd: string, projectTrusted: boolean, gl
     ...(global.tools === undefined && project.tools === undefined ? {} : { tools: [...(global.tools ?? []), ...(project.tools ?? [])] }),
   });
   const sources: WorkflowSettingsSources = { concurrency: project.concurrency === undefined ? globalSettingsPath : projectSettingsPath, modelAliases: project.modelAliases === undefined ? globalSettingsPath : projectSettingsPath };
-  for (const key of ["skills", "extensions", "tools", "extensionSettings", "retention"] as const) if (effective[key] !== undefined) sources[key] = project[key] === undefined ? globalSettingsPath : projectSettingsPath;
+  for (const key of ["skills", "extensions", "tools", "extensionSettings", "retention", "worktreeSetup"] as const) if (effective[key] !== undefined) sources[key] = project[key] === undefined ? globalSettingsPath : projectSettingsPath;
   return { globalSettingsPath, projectSettingsPath, projectTrusted, global, project, effective, sources, selectorSources };
 }
 export function validateModelAliasAvailability(aliases: Readonly<Record<string, string>>, names: readonly string[], availableModels: ReadonlySet<string>, knownModels: ReadonlySet<string>, settingsPath?: string): void {

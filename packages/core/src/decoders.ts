@@ -155,11 +155,12 @@ function decodeWorkflowSettings(value: unknown): LaunchSnapshot["settings"] | un
   const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
   const effectiveExtensionSettings = extensionSettings ?? legacyExtensionSettings;
   const retention = value.retention === undefined ? undefined : decodeRetention(value.retention);
-  if (backgroundWidget === INVALID_PERSISTED_VALUE || (value.modelAliases !== undefined && !modelAliases) || value.skills !== undefined && !skills || value.tools !== undefined && !tools || value.extensions !== undefined && !extensions && !legacyExtensionSettings || value.extensionSettings !== undefined && !extensionSettings || retention === INVALID_PERSISTED_VALUE) return undefined;
+  const worktreeSetup = value.worktreeSetup === undefined ? undefined : decodeStringArray(value.worktreeSetup);
+  if (backgroundWidget === INVALID_PERSISTED_VALUE || (value.modelAliases !== undefined && !modelAliases) || value.skills !== undefined && !skills || value.tools !== undefined && !tools || value.extensions !== undefined && !extensions && !legacyExtensionSettings || value.extensionSettings !== undefined && !extensionSettings || retention === INVALID_PERSISTED_VALUE || value.worktreeSetup !== undefined && !worktreeSetup) return undefined;
   return {
     concurrency: value.concurrency,
     ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(modelAliases === undefined ? {} : { modelAliases }), ...(skills === undefined ? {} : { skills }), ...(tools === undefined ? {} : { tools }),
-    ...(extensions === undefined ? {} : { extensions }), ...(effectiveExtensionSettings === undefined ? {} : { extensionSettings: effectiveExtensionSettings }), ...(retention === undefined ? {} : { retention }),
+    ...(extensions === undefined ? {} : { extensions }), ...(effectiveExtensionSettings === undefined ? {} : { extensionSettings: effectiveExtensionSettings }), ...(retention === undefined ? {} : { retention }), ...(worktreeSetup === undefined ? {} : { worktreeSetup }),
   };
 }
 function decodeWorkflowSettingsSources(value: unknown): NonNullable<LaunchSnapshot["settingsSources"]> | undefined {
@@ -169,8 +170,9 @@ function decodeWorkflowSettingsSources(value: unknown): NonNullable<LaunchSnapsh
   const tools = value.tools === undefined ? undefined : typeof value.tools === "string" ? value.tools : undefined;
   const extensionSettings = value.extensionSettings === undefined ? undefined : typeof value.extensionSettings === "string" ? value.extensionSettings : undefined;
   const retention = value.retention === undefined ? undefined : typeof value.retention === "string" ? value.retention : undefined;
-  if (value.skills !== undefined && skills === undefined || value.extensions !== undefined && extensions === undefined || value.tools !== undefined && tools === undefined || value.extensionSettings !== undefined && extensionSettings === undefined || value.retention !== undefined && retention === undefined) return undefined;
-  return { concurrency: value.concurrency, modelAliases: value.modelAliases, ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(retention === undefined ? {} : { retention }) };
+  const worktreeSetup = value.worktreeSetup === undefined ? undefined : typeof value.worktreeSetup === "string" ? value.worktreeSetup : undefined;
+  if (value.skills !== undefined && skills === undefined || value.extensions !== undefined && extensions === undefined || value.tools !== undefined && tools === undefined || value.extensionSettings !== undefined && extensionSettings === undefined || value.retention !== undefined && retention === undefined || value.worktreeSetup !== undefined && worktreeSetup === undefined) return undefined;
+  return { concurrency: value.concurrency, modelAliases: value.modelAliases, ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(retention === undefined ? {} : { retention }), ...(worktreeSetup === undefined ? {} : { worktreeSetup }) };
 }
 function decodeIdentity(value: unknown): PersistedIdentity | undefined {
   if (!object(value) || typeof value.callSite !== "string" || !positiveInteger(value.occurrence)) return undefined;

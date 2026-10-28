@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -771,6 +771,35 @@ void test("cleans a created branch when worktree add fails before cwd exists", a
   await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
   assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", branch], { stdio: "ignore" }));
   assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")), []);
+});
+
+void test("worktreeSetup runs in order only when a worktree is physically created, and a failing command removes it", { skip: process.platform === "win32" }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-setup-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, ".gitignore"), ".env\nsetup.log\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  writeFileSync(join(repo, ".env"), "SECRET=1");
+  const setup = ['cp "$PIEWF_SOURCE_ROOT/.env" .env', 'printf "%s|%s|%s\\n" "$PWD" "$PIEWF_WORKTREE_PATH" "$PIEWF_WORKTREE_BRANCH" >> setup.log'];
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), createLaunchSnapshot({ ...snapshot, settings: { ...snapshot.settings, worktreeSetup: setup } }));
+  const created = await store.worktree("agent");
+  assert.equal(readFileSync(join(created.path, ".env"), "utf8"), "SECRET=1");
+  assert.equal(readFileSync(join(created.path, "setup.log"), "utf8"), `${realpathSync(created.path)}|${created.path}|${created.branch}\n`);
+  await store.worktree("agent");
+  assert.equal(readFileSync(join(created.path, "setup.log"), "utf8").split("\n").filter(Boolean).length, 1);
+
+  const failing = new RunStore(repo, "session-a", "run-b", home);
+  await failing.create({ ...run(repo), id: "run-b" }, createLaunchSnapshot({ ...snapshot, settings: { ...snapshot.settings, worktreeSetup: ["echo first > first.txt", "echo broken >&2; exit 3", "echo never > never.txt"] } }));
+  const key = createHash("sha256").update("session-a\0run-b\0agent").digest("hex").slice(0, 16);
+  await assert.rejects(failing.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && /"echo broken >&2; exit 3" exited with 3: broken/.test(error.message));
+  assert.equal(existsSync(join(failing.directory, "worktrees", key)), false);
+  assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", `pi-extensible-workflows/run-b/${key}`], { stdio: "ignore" }));
+  assert.deepEqual(await failing.worktrees(), []);
 });
 
 void test("worktree creation failures are typed and never fall back", async () => {

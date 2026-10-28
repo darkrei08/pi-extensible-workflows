@@ -13,7 +13,7 @@ import {
   type Journal, type PendingWorkflowDecision, type PersistedOwnershipNode,
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference, type EvidenceRecord,
 } from "./decoders.js";
-import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
+import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json, runWorktreeSetup } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
@@ -703,6 +703,9 @@ export class RunStore {
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
+        // Only a physically new worktree runs the launch's setup; existing, borrowed, and inherited worktrees returned above.
+        const setup = loaded.snapshot.settings.worktreeSetup;
+        if (setup?.length) await runWorktreeSetup(setup, path, { PIEWF_WORKTREE_PATH: path, PIEWF_SOURCE_ROOT: root, PIEWF_WORKTREE_BRANCH: branch });
         await atomicJson(recordsPath, [...records, record]);
         await rm(markerPath, { force: true });
         return record;

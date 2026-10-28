@@ -932,7 +932,8 @@ class PersistentSubagentManager implements SubagentManager {
         live.worktreeContext = worktreeContext;
         await enqueueWrite(live, () => atomicJson(statusPath(live.directory), persistedStatus(live)));
       }
-      const worktree = worktreeContext === undefined ? undefined : await this.worktreeAdapter.create(worktreeContext);
+      const worktreeSetup = worktreeContext === undefined ? undefined : resolveWorkflowSettings(context.extensionContext.cwd, context.extensionContext.isProjectTrusted(), workflowSettingsPath(this.dependencies.agentDir ?? getAgentDir())).effective.worktreeSetup;
+      const worktree = worktreeContext === undefined ? undefined : await this.worktreeAdapter.create(worktreeContext, worktreeSetup);
       if (worktree) {
         live.worktree = worktree;
         await enqueueWrite(live, () => atomicJson(statusPath(live.directory), persistedStatus(live)));

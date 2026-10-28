@@ -25,7 +25,8 @@ export interface SubagentWorktreeHandle {
 }
 
 export interface SubagentWorktreeAdapter {
-  create(context: Readonly<SubagentWorktreeContext>): Promise<SubagentWorktreeHandle>;
+  /** `setup` is the effective `worktreeSetup` setting, run only when the worktree is physically created. */
+  create(context: Readonly<SubagentWorktreeContext>, setup?: readonly string[]): Promise<SubagentWorktreeHandle>;
   cleanup?(context: Readonly<SubagentWorktreeContext>): Promise<void>;
 }
 
@@ -41,14 +42,14 @@ function syntheticRun(context: Readonly<SubagentWorktreeContext>): PersistedRun 
   };
 }
 
-function syntheticSnapshot(): LaunchSnapshot {
+function syntheticSnapshot(setup: readonly string[] | undefined): LaunchSnapshot {
   return {
     identityVersion: LAUNCH_SNAPSHOT_IDENTITY_VERSION,
     launchMode: "background",
     script: "return null;",
     args: null,
     metadata: { name: "subagents" },
-    settings: { concurrency: 1 },
+    settings: { concurrency: 1, ...(setup?.length ? { worktreeSetup: [...setup] } : {}) },
     models: [],
     tools: [],
     agentConfigurations: {},
@@ -58,10 +59,10 @@ function syntheticSnapshot(): LaunchSnapshot {
 export function createRunStoreWorktreeAdapter(home: string): SubagentWorktreeAdapter {
   let createQueue: Promise<void> = Promise.resolve();
   return {
-    create(context) {
+    create(context, setup) {
       const operation = createQueue.then(async () => {
         const store = new RunStore(context.cwd, context.sessionId, context.runId, home);
-        await store.create(syntheticRun(context), syntheticSnapshot());
+        await store.create(syntheticRun(context), syntheticSnapshot(setup));
         try {
           const reference = await store.worktree(context.owner);
           let cleaned = false;

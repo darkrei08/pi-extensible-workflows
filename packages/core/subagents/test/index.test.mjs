@@ -9,6 +9,7 @@ import test from "node:test";
 import { Value } from "typebox/value";
 import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, WorkflowError, prepareAgentSetupForInspection, registerWorkflowExtension, resetWorkflowRegistry } from "pi-extensible-workflows";
 import extension, {
+  createRunStoreWorktreeAdapter,
   createSubagentManager,
   createSubagentTools,
   normalizeSubagentRunRequest,
@@ -1074,6 +1075,58 @@ function deferredExecution(prompt, pending, started) {
     pending.set(prompt, { resolve, reject });
   });
 }
+
+test("subagent worktrees receive the effective worktreeSetup and run it on creation", { skip: process.platform === "win32" }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-worktree-setup-"));
+  const agentDir = join(cwd, "agent");
+  await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  await writeFile(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ worktreeSetup: ["echo global"] }));
+  await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+  await writeFile(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ worktreeSetup: ["echo project"] }));
+  const pending = new Map();
+  const setups = [];
+  const manager = createSubagentManager({
+    storageDir: join(cwd, "subagents-storage"),
+    agentDir,
+    worktreeAdapter: {
+      async create(input, setup) {
+        setups.push(setup);
+        return { path: join(cwd, input.name), branch: `subagent/${input.name}`, cwd, runStore: { async recordSystemPrompt() {}, async validateWorktree() { throw new Error("unused"); }, async worktree() { throw new Error("unused"); }, async snapshotWorktree() { throw new Error("unused"); } }, async cleanup() {} };
+      },
+    },
+    createExecutor() { return { execute(prompt) { return deferredExecution(prompt, pending, []); } }; },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const launched = await manager.run({ prompt: "setup", worktree: "setup" }, context);
+    await waitFor(() => setups.length === 1);
+    assert.deepEqual(setups, [["echo project"]]);
+    await waitFor(() => pending.has("setup"));
+    pending.get("setup").resolve({ value: { answer: "ok" }, attempts: [], cwd });
+    await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "completed");
+  } finally {
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+
+  const repo = await mkdtemp(join(tmpdir(), "subagents-worktree-setup-repo-"));
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  await writeFile(join(repo, ".gitignore"), "marker.txt\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const home = await mkdtemp(join(tmpdir(), "subagents-worktree-setup-home-"));
+  const adapter = createRunStoreWorktreeAdapter(home);
+  const handle = await adapter.create({ cwd: repo, sessionId: "session", runId: "run-setup", name: "setup", owner: "worktree/named/setup" }, ["echo created > marker.txt"]);
+  try {
+    assert.equal(await readFile(join(handle.path, "marker.txt"), "utf8"), "created\n");
+  } finally {
+    await handle.cleanup();
+    await rm(repo, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("runs simultaneous background subagents and settles them independently", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-background-concurrent-"));

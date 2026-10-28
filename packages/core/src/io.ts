@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -69,6 +69,21 @@ export async function atomicPrettyJson(path: string, value: unknown): Promise<vo
 }
 
 export async function json(path: string): Promise<unknown> { return JSON.parse(await readFile(path, "utf8")); }
+
+const WORKTREE_SETUP_TIMEOUT_MS = 10 * 60 * 1000;
+/** Runs the `worktreeSetup` commands in order inside a new worktree; the first failure stops them and names its command and output tail. */
+export async function runWorktreeSetup(commands: readonly string[], cwd: string, env: Readonly<Record<string, string>>): Promise<void> {
+  for (const command of commands) {
+    // NOTE: the timeout kills the shell, not processes the command left running in the background.
+    try { await promisify(exec)(command, { cwd, env: { ...process.env, ...env }, timeout: WORKTREE_SETUP_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: 10 * 1024 * 1024 }); }
+    catch (error) {
+      const failure = error as { stderr?: unknown; stdout?: unknown; killed?: unknown; code?: unknown };
+      const output = `${typeof failure.stderr === "string" ? failure.stderr : ""}${typeof failure.stdout === "string" ? failure.stdout : ""}`.trim().slice(-2000);
+      const reason = failure.killed === true ? `timed out after ${String(WORKTREE_SETUP_TIMEOUT_MS / 60_000)} minutes` : `exited with ${String(failure.code)}`;
+      throw new WorkflowError("WORKTREE_FAILED", `worktreeSetup command ${JSON.stringify(command)} ${reason}${output ? `: ${output}` : ""}`);
+    }
+  }
+}
 export async function git(cwd: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}, limits: { readonly timeout?: number; readonly maxBuffer?: number } = {}): Promise<string> {
   const { stdout } = await execute("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd, env: { ...process.env, ...extraEnv }, encoding: "utf8", maxBuffer: 10 * 1024 * 1024, ...limits });
   return stdout;

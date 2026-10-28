@@ -412,6 +412,16 @@ void test("resolves trusted project settings with replacement and inheritance se
   assert.equal(partial.effective.concurrency, 3);
   assert.deepEqual(partial.effective.modelAliases, { reviewer: "openai/gpt" });
   assert.deepEqual(partial.effective.skills, ["global"]);
+  writeFileSync(globalPath, JSON.stringify({ concurrency: 6, worktreeSetup: ["global-setup"] }));
+  writeFileSync(projectPath, JSON.stringify({ worktreeSetup: ["wt step copy-ignored --require-include", "pnpm install"] }));
+  const withSetup = resolveWorkflowSettings(cwd, true, globalPath);
+  assert.deepEqual(withSetup.effective.worktreeSetup, ["wt step copy-ignored --require-include", "pnpm install"]);
+  assert.equal(withSetup.sources.worktreeSetup, projectPath);
+  assert.deepEqual(resolveWorkflowSettings(cwd, false, globalPath).effective.worktreeSetup, ["global-setup"]);
+  for (const invalid of ["wt step copy-ignored", [""], ["ok", 1]]) {
+    writeFileSync(projectPath, JSON.stringify({ worktreeSetup: invalid }));
+    assert.throws(() => resolveWorkflowSettings(cwd, true, globalPath), /worktreeSetup must be an array of non-empty shell commands/);
+  }
   writeFileSync(projectPath, JSON.stringify({ backgroundWidget: false }));
   assert.throws(() => resolveWorkflowSettings(cwd, true, globalPath), /Unknown workflow setting/);
   writeFileSync(projectPath, "{ malformed");
