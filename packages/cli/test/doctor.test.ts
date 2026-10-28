@@ -13,8 +13,8 @@ import test from "node:test";
 
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
-import { formatWorkflowCliHelp, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { WorkflowRegistry } from "pi-extensible-workflows";
+import { CliProgress, formatWorkflowCliHelp, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { registerWorkflowExtension, WorkflowRegistry, type PersistedRun } from "pi-extensible-workflows";
 
 import { isCliTestBundleExtension, isCliTestBundleModule, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
 import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
@@ -492,6 +492,111 @@ void test("CLI TTY progress repaints and respects terminal width", async () => {
   assert.ok(stderr.includes("\u001b[?25l"));
   assert.ok(stderr.includes("\u001b[1A"));
   assert.match(stderr, /…/);
+});
+function emulateTerminal(output: string, rows: number): { history: string[]; screen: string[] } {
+  const history: string[] = [];
+  const screen = Array.from({ length: rows }, () => "");
+  let row = 0;
+  let column = 0;
+  const scroll = () => { history.push(screen.shift() ?? ""); screen.push(""); row = rows - 1; };
+  const eraseDisplay = () => { screen[row] = screen[row]?.slice(0, column) ?? ""; for (let index = row + 1; index < rows; index += 1) screen[index] = ""; };
+  const csi = new RegExp(`${String.fromCharCode(27)}\\[([0-9;?]*)([A-Za-z])`, "y");
+  for (let index = 0; index < output.length;) {
+    csi.lastIndex = index;
+    const control = csi.exec(output);
+    if (control) {
+      const parameters = control[1] ?? "";
+      const command = control[2] ?? "";
+      const amount = Number(parameters.replace("?", "").split(";")[0] || 1);
+      if (command === "A") row = Math.max(0, row - amount);
+      else if (command === "B") row = Math.min(rows - 1, row + amount);
+      else if (command === "J" && parameters === "0") eraseDisplay();
+      else if (command === "K" && parameters === "2") { screen[row] = ""; column = 0; }
+      index = csi.lastIndex;
+    } else if (output[index] === "\r") {
+      column = 0;
+      index += 1;
+    } else if (output[index] === "\n") {
+      column = 0;
+      if (row === rows - 1) scroll(); else row += 1;
+      index += 1;
+    } else if (output[index] === "\x1b") {
+      index += 1;
+    } else {
+      const character = output[index] ?? "";
+      screen[row] = `${screen[row]?.slice(0, column) ?? ""}${character}${screen[row]?.slice(column + 1) ?? ""}`;
+      column += 1;
+      index += character.length;
+    }
+  }
+  return { history, screen };
+}
+
+void test("CLI TTY progress keeps an oversized block out of scrollback", () => {
+  const makeRun = (phaseCount: number, logCount: number, durationMs: number, shell: boolean): PersistedRun => ({
+    id: "tall-progress",
+    workflowName: "cliTallProgress",
+    cwd: "/project",
+    sessionId: "session",
+    state: "running",
+    budget: { durationMs: { hard: 600_000 } },
+    budgetVersion: 1,
+    usage: { tokens: 0, costUsd: 0, durationMs, agentLaunches: 0 },
+    ...(shell ? { activeShells: 1, activeShellStartedAt: 0 } : {}),
+    phaseHistory: Array.from({ length: phaseCount }, (_, index) => ({ phase: `phase-${String(index)}`, afterAgent: 0 })),
+    agents: [{ id: "agent", name: "worker", path: "agent", state: "running", model: { provider: "fixture", model: "model" }, tools: [], attempts: 1 }],
+    agentSessions: [],
+    events: Array.from({ length: logCount }, (_, index) => ({ type: "log", message: `record-${String(index)}`, timestamp: index })),
+  });
+  const rows = 5;
+  const previousRows = process.stderr.rows;
+  Object.defineProperty(process.stderr, "rows", { configurable: true, value: rows });
+  let stderr = "";
+  try {
+    const progress = new CliProgress((text) => { stderr += text; }, true, () => {});
+    try {
+      const frames = [makeRun(8, 0, 1_000, false), makeRun(9, 0, 2_000, false), makeRun(9, 3, 3_000, true), makeRun(10, 8, 4_000, true), makeRun(10, 9, 5_000, false)];
+      for (const frame of frames) {
+        progress.update(frame);
+        progress.render();
+        const terminal = emulateTerminal(stderr, rows);
+        assert.deepEqual(terminal.history, [], terminal.history.join("\n"));
+        assert.ok(terminal.screen.filter((line) => line !== "").length <= rows - 1, terminal.screen.join("\n"));
+        assert.ok(terminal.screen[0]?.includes("Workflow: cliTallProgress"), terminal.screen.join("\n"));
+      }
+      assert.ok(emulateTerminal(stderr, rows).screen.some((line) => line.includes("record-8")), emulateTerminal(stderr, rows).screen.join("\n"));
+    } finally { progress.finish(); }
+  } finally { Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows }); }
+  assert.ok(emulateTerminal(stderr, rows).screen.every((line) => line === ""));
+});
+void test("CLI TTY progress run stays inside a short terminal", async () => {
+  registerWorkflowExtension({
+    version: "1.0.0",
+    headline: "CLI tall progress test",
+    functions: {
+      cliTallRunProgress: {
+        description: "Render more phases than the terminal can show",
+        input: { type: "object", additionalProperties: false },
+        output: { type: "boolean" },
+        run: async (_input, context) => {
+          for (let index = 0; index < 10; index += 1) context.phase(`phase-${String(index)}`);
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+          return true;
+        },
+      },
+    },
+  });
+  const paths = fixture();
+  let stderr = "";
+  const previousRows = process.stderr.rows;
+  Object.defineProperty(process.stderr, "rows", { configurable: true, value: 5 });
+  try {
+    assert.equal(await runCli(["run", "cliTallRunProgress"], { cwd: paths.cwd, agentDir: paths.agentDir, isTTY: true, stderr: (text) => { stderr += text; } }, () => {}), 0);
+  } finally {
+    Object.defineProperty(process.stderr, "rows", { configurable: true, value: previousRows });
+  }
+  const terminal = emulateTerminal(stderr, 5);
+  assert.ok(terminal.history.every((line) => !line.includes("Workflow: cliTallRunProgress") && !line.includes("[Phase:")), terminal.history.join("\n"));
 });
 void test("CLI TTY progress disables colors with NO_COLOR", async () => {
   registerCliExtension();

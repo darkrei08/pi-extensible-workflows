@@ -426,7 +426,7 @@ function terminalProgressStyles(enabled: boolean): WorkflowProgressStyles {
   const style = (code: number) => enabled ? (text: string) => `\x1b[${String(code)}m${text}\x1b[0m` : (text: string) => text;
   return { accent: style(36), success: style(32), error: style(31), warning: style(33), muted: style(90), dim: style(2), bold: style(1) };
 }
-class CliProgress {
+export class CliProgress {
   #lastStable = "";
   #lines = 0;
   #frame = 0;
@@ -472,9 +472,15 @@ class CliProgress {
     }
     const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame++ % 10] ?? "◇";
     const width = process.stderr.columns || 80;
-    const text = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles), width).join("\n");
-    this.stderr(`${this.#lines ? `\x1b[${String(this.#lines)}A` : ""}${this.#lines ? "" : "\x1b[?25l"}\x1b[0J${text}\n`);
-    this.#lines = text.split("\n").length;
+    // Keep the block within the viewport: a terminal cannot repaint rows that scrolled into its history.
+    const maxLines = Math.max(1, (process.stderr.rows || 24) - 1);
+    let lines = truncateWorkflowProgress(formatWorkflowProgress(run, spinner, this.#styles, Date.now(), false, undefined, false, maxLines), width);
+    if (lines.length > maxLines) {
+      const tail = maxLines - 2;
+      lines = tail > 0 ? [lines[0] ?? "", this.#styles.muted(`  … ${String(lines.length - 1 - tail)} more lines`), ...lines.slice(-tail)] : lines.slice(-maxLines);
+    }
+    this.stderr(`${this.#lines ? `\x1b[${String(this.#lines)}A` : ""}${this.#lines ? "" : "\x1b[?25l"}\x1b[0J${lines.join("\n")}\n`);
+    this.#lines = lines.length;
   }
   finish(): void {
     if (this.#timer) { clearInterval(this.#timer); this.#timer = undefined; }
