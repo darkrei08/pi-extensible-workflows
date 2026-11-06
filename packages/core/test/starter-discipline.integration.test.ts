@@ -45,9 +45,11 @@ function initRepo(root: string): void {
 
 // --- Helpers: shell and context ---
 
-// Runs a shell command in `dir`, recording it in `calls`.
-function runInDir(dir: string, command: string, calls: string[], timeoutMs = 120_000): Promise<ShellResult> {
-  calls.push(command);
+type RecordedCall = { command: string; cwd: string };
+
+// Runs a shell command in `dir`, recording the command with its working directory in `calls`.
+function runInDir(dir: string, command: string, calls: RecordedCall[], timeoutMs = 120_000): Promise<ShellResult> {
+  calls.push({ command, cwd: dir });
   return new Promise<ShellResult>((resolve, reject) => {
     const child = spawn("/bin/sh", ["-c", command], { cwd: dir, env: { ...process.env, GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "t@t" } });
     const chunks: Buffer[] = [];
@@ -74,9 +76,9 @@ function buildContext(
     agentFn?: (prompt: string, opts: Record<string, unknown>, worktreePath: string) => Promise<unknown>;
     reusedWorktrees?: Record<string, ReusedWorktree>;
   } = {},
-): { context: WorkflowFunctionContext; calls: string[]; worktreePaths: string[] } {
-  const calls: string[] = [];
-  const worktreePaths: string[] = [];
+): { context: WorkflowFunctionContext; calls: RecordedCall[]; stats: { worktreeCalls: number; createdWorktrees: string[] } } {
+  const calls: RecordedCall[] = [];
+  const stats = { worktreeCalls: 0, createdWorktrees: [] as string[] };
   // Track the active worktree cwd for shell calls.
   let activeCwd: string = repoRoot;
 
@@ -84,6 +86,7 @@ function buildContext(
     runInDir(activeCwd, command, calls, options?.timeoutMs);
 
   const withWorktreeFn = async <R>(name: string, callback: (ref: WorkflowWorktreeReference) => R | Promise<R>): Promise<R> => {
+    stats.worktreeCalls += 1;
     const reused = opts.reusedWorktrees?.[name];
     if (reused) {
       const prev = activeCwd;
@@ -98,7 +101,7 @@ function buildContext(
     const wtPath = join(repoRoot, ".worktrees", name);
     mkdirSync(join(repoRoot, ".worktrees"), { recursive: true });
     gitInDir(repoRoot, `worktree add -b ${branch} ${wtPath}`);
-    worktreePaths.push(wtPath);
+    stats.createdWorktrees.push(wtPath);
     const prev = activeCwd;
     activeCwd = wtPath;
     try {
@@ -107,18 +110,16 @@ function buildContext(
       activeCwd = prev;
       // Clean up worktree
       gitInDir(repoRoot, `worktree remove --force ${wtPath}`);
-      const idx = worktreePaths.indexOf(wtPath);
-      if (idx >= 0) worktreePaths.splice(idx, 1);
     }
   };
 
   const checkpointFn = async (): Promise<boolean> => {
-    calls.push("checkpoint");
+    calls.push({ command: "checkpoint", cwd: activeCwd });
     return opts.checkpointReturn ?? true;
   };
 
   const agentFn = async (prompt: string, options?: Record<string, unknown>): Promise<unknown> => {
-    calls.push("agent");
+    calls.push({ command: "agent", cwd: activeCwd });
     if (opts.agentFn) return opts.agentFn(prompt, options ?? {}, activeCwd);
     return { verdicts: [] };
   };
@@ -130,7 +131,7 @@ function buildContext(
     agent: Object.assign(agentFn, { create: () => { throw new Error("unused"); } }),
   } as unknown as WorkflowFunctionContext;
 
-  return { context, calls, worktreePaths };
+  return { context, calls, stats };
 }
 
 // --- Scenario helpers ---
@@ -163,13 +164,19 @@ void describe("starter discipline integration", () => {
   void test("specRedGreen happy path: RED fails, writer fixes, GREEN passes", async () => {
     scenarioRoot = mkdtempSync(join(tmpdir(), "disc-1-"));
     initRepo(scenarioRoot);
-    const { context, calls, worktreePaths } = buildContext(scenarioRoot, {
-      agentFn: async (prompt, _opts, worktreePath) => {
-        // Assert the prompt mentions the spec path and the requirement id
+    const worktreePath = join(scenarioRoot, ".worktrees", "happypath");
+    const redCommand = "node check.js || { echo RED; exit 1; }";
+    const greenCommand = "node check.js || { echo GREEN; exit 1; }";
+    const { context, calls, stats } = buildContext(scenarioRoot, {
+      agentFn: async (prompt, _opts, writerCwd) => {
+        // Assert the prompt mentions the spec path, the requirement id, and the worktree path
         assert.match(prompt, /spec\.md/, "prompt must name the spec path");
         assert.match(prompt, /S1/, "prompt must name requirement S1");
+        // The path handed to the writer must be the created worktree, never the repository root.
+        assert.ok(prompt.includes(worktreePath), "prompt must name the worktree path");
+        assert.equal(writerCwd, worktreePath, "writer must run inside the created worktree");
         // The writer edits the source file so GREEN will pass
-        writeFileSync(join(worktreePath, "src.txt"), "DONE");
+        writeFileSync(join(writerCwd, "src.txt"), "DONE");
         return {
           verdicts: [
             { requirementId: "S1", verdict: "pass", evidence: ["wrote DONE to src.txt"] },
@@ -182,8 +189,8 @@ void describe("starter discipline integration", () => {
       {
         specPath: "spec.md",
         worktree: "happypath",
-        redCommand: "node check.js",
-        greenCommand: "node check.js",
+        redCommand,
+        greenCommand,
         timeoutMs: 30_000,
       },
       context,
@@ -195,16 +202,13 @@ void describe("starter discipline integration", () => {
     assert.equal(result.verdicts[0]?.requirementId, "S1");
     assert.deepEqual(result.problems, []);
 
-    // Prove RED ran before the writer: calls order is [cat spec, checkpoint, RED command, agent, GREEN command]
-    const catIdx = calls.indexOf("cat -- 'spec.md'");
-    const redIdx = calls.indexOf("node check.js");
-    const agentIdx = calls.indexOf("agent");
-    const greenIdx = calls.lastIndexOf("node check.js");
-    assert.ok(catIdx >= 0, "cat must appear");
-    assert.ok(redIdx >= 0 && redIdx < agentIdx, "RED must run before agent");
-    assert.ok(agentIdx < greenIdx, "agent must run before GREEN");
+    // The exact recorded order proves spec read, RED, writer, GREEN, each in its own directory.
+    const steps = calls.filter(({ command }) => command !== "checkpoint");
+    assert.deepEqual(steps.map(({ command }) => command), ["cat -- 'spec.md'", redCommand, "agent", greenCommand]);
+    assert.deepEqual(steps.map(({ cwd }) => cwd), [scenarioRoot, worktreePath, worktreePath, worktreePath]);
 
-    assert.equal(worktreePaths.length, 0, "worktree must be cleaned up");
+    assert.equal(stats.worktreeCalls, 1, "withWorktree must be invoked exactly once");
+    assert.deepEqual(stats.createdWorktrees, [worktreePath]);
     assertNoLeftoverWorktrees(scenarioRoot);
   });
 
