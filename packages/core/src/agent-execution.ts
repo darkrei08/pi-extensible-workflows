@@ -3,7 +3,7 @@ import { copyFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { Compile } from "typebox/compile";
 import { createAgentSession, createCodemodeExtension, createMcpExtension, createToolSearchExtension, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager, loadSkills, type InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -269,7 +269,7 @@ async function buildSystemPromptForInspection(options: unknown): Promise<string>
   return (await loadNativeCoreModule("system-prompt.js", "system prompt builder") as { buildSystemPrompt(options: unknown): string }).buildSystemPrompt(options);
 }
 type NativePromptSession = PiSession & {
-  readonly _extensionRunner?: { hasHandlers(event: string): boolean; emitInput(text: string, images: undefined, source: "interactive"): Promise<unknown>; emitBeforeAgentStart(prompt: string, images: undefined, options: unknown): Promise<unknown>; onError(listener: (error: unknown) => void): () => void };
+  readonly _extensionRunner?: { hasHandlers(event: string): boolean; emitInput(text: string, images: undefined, source: "interactive"): Promise<unknown>; emitBeforeAgentStart(...args: unknown[]): Promise<unknown>; onError(listener: (error: unknown) => void): () => void };
   readonly _baseSystemPromptOptions?: unknown;
   readonly _expandSkillCommand?: (text: string) => string;
   readonly promptTemplates?: readonly { name: string; content: string }[];
@@ -304,12 +304,17 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
       try { expandedPrompt = await expandPromptTemplateForInspection(skillExpanded, Array.isArray(templates) ? templates : []); }
       catch (error) { diagnostics.push({ type: "error", message: `Pi prompt template expansion is unavailable: ${errorText(error)}`, source: "Pi session" }); }
     }
-    const result = !inputHandled && runner && baseOptions !== undefined ? await runner.emitBeforeAgentStart(expandedPrompt, undefined, baseOptions) : undefined;
+    const result = !inputHandled && runner && baseOptions !== undefined ? await emitBeforeAgentStart(runner, expandedPrompt, baseOptions) : undefined;
     const prepared = result as { messages?: readonly unknown[]; systemPromptOptions?: unknown } | undefined;
     const systemPromptOptions = prepared?.systemPromptOptions ?? baseOptions;
     const systemPrompt = prepared?.systemPromptOptions === undefined ? baseSystemPrompt : await buildSystemPromptForInspection(prepared.systemPromptOptions);
     return { prompt: text, expandedPrompt, systemPrompt, systemPromptOptions, messages: prepared?.messages ?? [], inputHandled, diagnostics };
   } finally { unsubscribe?.(); }
+}
+
+// Pi 1.2.0 replaced (prompt, images, options) with (trigger, options).
+function emitBeforeAgentStart(runner: NonNullable<NativePromptSession["_extensionRunner"]>, prompt: string, options: unknown): Promise<unknown> {
+  return runner.emitBeforeAgentStart.length >= 3 ? runner.emitBeforeAgentStart(prompt, undefined, options) : runner.emitBeforeAgentStart({ messageType: "user", prompt }, options);
 }
 
 interface LocalPiSessionHandle { readonly session: PiSession; shutdown(reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> }
@@ -1137,13 +1142,13 @@ export class WorkflowAgentExecutor {
         if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree inheritance requires a persisted run");
         cwd = (await this.root.runStore.validateWorktree(options.worktreeOwner, options.cwd)).cwd;
       } else {
-        if (options.cwd !== this.root.cwd) throw new WorkflowError("INVALID_METADATA", "Shared-tree children must inherit the root cwd");
+        if (options.cwd && !sameFilesystemPath(options.cwd, this.root.cwd)) throw new WorkflowError("INVALID_METADATA", "Shared-tree children must inherit the root cwd");
         cwd = this.root.cwd;
       }
     } else if (options.worktreeOwner) {
       if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree scope requires a persisted run");
       const worktree = await this.root.runStore.worktree(options.worktreeOwner);
-      if (options.cwd && resolvePath(options.cwd) !== resolvePath(worktree.cwd)) throw new WorkflowError("WORKTREE_FAILED", "Agent cwd does not match its owned worktree");
+      if (options.cwd && !sameFilesystemPath(options.cwd, worktree.cwd)) throw new WorkflowError("WORKTREE_FAILED", "Agent cwd does not match its owned worktree");
       cwd = worktree.cwd;
     } else {
       if (options.cwd) throw new WorkflowError("INVALID_METADATA", "Only child agents or worktree scopes may provide a cwd");
@@ -1707,7 +1712,7 @@ export class FairAgentScheduler {
     const inheritedTools: readonly string[] = options.tools;
     const extensionSettings = options.extensionSettings ?? parent?.options.extensionSettings ?? run.extensionSettings;
     if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...inheritedTools]), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(options.agentIdentity ? { agentIdentity: Object.freeze({ ...options.agentIdentity, structuralPath: Object.freeze([...options.agentIdentity.structuralPath]) }) } : {}) });
-    if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
+    if (options.cwd && !sameFilesystemPath(options.cwd, parent.options.cwd)) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
     const parentCapabilities = parent.attemptCapabilities ?? (parent.options.configuration ? { tools: parent.options.configuration.tools, skills: parent.options.configuration.skills.slice(parent.options.configuration.skills.lastIndexOf("!*") + 1), extensions: parent.options.configuration.extensions.slice(parent.options.configuration.extensions.lastIndexOf("!*") + 1) } : parent.options.capabilities);
     const forbidden = inheritedTools.find((tool: string) => !(parentCapabilities?.tools ?? parent.options.tools).includes(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
@@ -1783,5 +1788,3 @@ export class FairAgentScheduler {
     this.#persistence = this.#persistence.then(() => this.writeOwnership?.(runId, ownership)).then(() => undefined, (error: unknown) => { if (!this.#persistenceErrors.has(runId)) this.#persistenceErrors.set(runId, error instanceof Error ? error : new WorkflowError("INTERNAL_ERROR", String(error))); });
   }
 }
-
-function resolvePath(path: string): string { return path.replace(/[\\/]+$/, ""); }

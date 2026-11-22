@@ -41,6 +41,7 @@ class FakeTerminal implements Terminal {
   clearScreen(): void { /* captured writes only */ }
   setTitle(): void { /* captured writes only */ }
   setProgress(): void { /* captured writes only */ }
+  setProgramStatus(): void { /* captured writes only */ }
 }
 
 const ESC = String.fromCharCode(27);
@@ -55,11 +56,11 @@ const THEME_COLOURS: Readonly<Record<keyof WorkflowProgressStyles, string>> = { 
 const paintWith = (key: keyof WorkflowProgressStyles) => (text: string): string => `${THEME_COLOURS[key]}${text}${ESC}[39m`;
 const STYLES: WorkflowProgressStyles = { accent: paintWith("accent"), success: paintWith("success"), error: paintWith("error"), warning: paintWith("warning"), muted: paintWith("muted"), dim: paintWith("dim"), bold: paintWith("bold") };
 
-function setup(cwd = tmpdir(), settings = SettingsManager.inMemory()): { readonly view: TranscriptView; readonly ui: TuiAltScreen; readonly terminal: FakeTerminal; readonly raw: (width?: number) => string[]; readonly text: (width?: number) => string } {
+function setup(cwd = tmpdir(), settings = SettingsManager.inMemory()): { readonly view: TranscriptView; readonly ui: TuiAltScreen; readonly terminal: FakeTerminal; readonly raw: (width?: number) => readonly string[]; readonly text: (width?: number) => string } {
   const terminal = new FakeTerminal();
   const ui = new TuiAltScreen(terminal);
   const view = createTranscriptView({ ui, cwd, styles: STYLES, settings });
-  const raw = (width = 80): string[] => {
+  const raw = (width = 80): readonly string[] => {
     const lines = view.component.render(width);
     for (const line of lines) assert.ok(visibleWidth(line) <= width, `wider than ${String(width)}: ${JSON.stringify(stripTerminalSequences(line))}`);
     return lines;
