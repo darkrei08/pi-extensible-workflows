@@ -70,7 +70,7 @@ function reviewCheckpointOverlay(ctx: ExtensionContext, checkpoint: Parameters<A
     const options = ["Approve", "Reject", "Cancel"];
     let selectedIndex = 0;
     let offset = 0;
-    let renderedLines: string[] = [];
+    let renderedLines: readonly string[] = [];
     const layout = () => {
       const rows = Math.max(1, tuiRows(tui) - WORKFLOW_OVERLAY_BORDER_ROWS);
       const compactControls = rows < 4;

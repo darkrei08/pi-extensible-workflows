@@ -1,0 +1,9 @@
+Feature: pi16-dependency-fix
+
+Tasks
+- T1 | S1-S3 | Bump Pi packages to 1.6.0 and update lockfile | pending
+- T2 | S2 | Clear minimatch/undici audit exceptions safely | pending
+- T3 | S1-S3 | Verify package checks, typecheck and tests | pending
+
+Log
+- L1: User request recorded verbatim in odd/tasks/pi16-dependency-fix-20261122.md.
