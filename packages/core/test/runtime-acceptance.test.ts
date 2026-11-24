@@ -8,7 +8,7 @@ import test from "node:test";
 import { callUnchecked, contextualWorkflowAction, executeTool, executeToolCall, testExtensionContext, testExtensionContextFor, testExtensionApi } from "./support.js";
 import { Type, type TSchema } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, loadingRegistry, localAgentTransport, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowExtension, runWorkflow, shellIdentityPath, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue, type PersistedRun, type WorkflowExtension } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, herdrPaneIdentity, herdrSessionReference, loadingRegistry, localAgentTransport, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowExtension, runWorkflow, shellIdentityPath, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue, type PersistedRun, type WorkflowExtension } from "../src/index.js";
 import { createLocalPiSession } from "../src/agent-execution.js";
 import { listRunIds, runsDirectory, RunStore } from "../src/persistence.js";
 import type { SessionInput } from "../src/agent-execution.js";
@@ -507,6 +507,21 @@ void test("terminal failed attempts remain persisted", async () => {
   const persisted = (await store.load()).run;
   assert.deepEqual(persisted.agents.map(({ attempts, accounting }) => ({ attempts, accounting })), [{ attempts: 1, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);
   assert.deepEqual(persisted.agentSessions, [{ transport: "local", sessionId: "failed-session", locator: { sessionFile: "/sessions/failed.jsonl" } }]);
+});
+
+void test("persists verified Herdr pane identity with the attempt and run session", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-herdr-identity-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ id: "run-a", workflowName: "herdr", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], agentSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'herdr',description:'herdr'}", args: null, metadata: { name: "herdr" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
+  const local = { transport: "local", sessionId: "herdr-session", locator: { sessionFile: "/sessions/herdr.jsonl" } };
+  const session = herdrSessionReference(local, herdrPaneIdentity({ workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1" }));
+  await persistAgentAttempts(store, "run-a:1", [{ attempt: 1, transport: "herdr", session, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);
+  const persisted = (await store.load()).run;
+  assert.deepEqual(local, { transport: "local", sessionId: "herdr-session", locator: { sessionFile: "/sessions/herdr.jsonl" } });
+  assert.deepEqual(persisted.agentSessions, [session]);
+  assert.deepEqual(persisted.agents[0]?.attemptDetails?.[0]?.session, session);
+  await rm(home, { recursive: true, force: true });
 });
 
 void test("registered extension agents persist structural scope for late siblings", async () => {

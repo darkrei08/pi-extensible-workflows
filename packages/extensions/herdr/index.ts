@@ -18,6 +18,8 @@ import {
   errorText,
   herdrAvailable,
   herdrCommandRunner,
+  herdrPaneIdentity,
+  herdrSessionReference,
   loadSettings,
   openHerdrLivePane,
   waitForHerdrPane,
@@ -36,6 +38,7 @@ import type {
   HerdrAgentReporter,
   HerdrAgentStatus,
   HerdrCommandRunner,
+  HerdrPaneIdentity,
   HerdrWorkspacePane,
   HerdrWorkspacePaneRequest,
   PreparedAgentSession,
@@ -68,7 +71,7 @@ type LifecycleBridgeRequest = { type: "agent_settled" };
 type ToolBridgeMessage = { type: "update"; value: unknown } | { type: "error"; error: string } | { type: "result"; value: unknown } | { type: "ack" };
 type WorkspaceManager = { open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane>; close(runId: string): Promise<void>; closeAll(): Promise<void> };
 type LaunchPaneOptions = { session: HerdrSession; prepared: Readonly<PreparedAgentSession>; identity: Readonly<AgentIdentity>; run?: Readonly<WorkflowRunContext> | undefined; attempt: number; runner: HerdrCommandRunner; fullyInspectable: boolean; env: NodeJS.ProcessEnv; signal: AbortSignal; prompt?: string | undefined; workspaces?: WorkspaceManager | undefined; tuiIndex?: number | undefined; tuiLabel?: string | undefined; directPrompt?: boolean | undefined; onStatus?: ((state: HerdrAgentStatus) => void | Promise<void>) | undefined };
-type PaneHandle = { pane: string; monitor: Promise<"closed" | "exited" | "idle" | "settled" | "aborted">; reporter: HerdrAgentReporter; closeRemote(): Promise<void>; close(): Promise<void> };
+type PaneHandle = { pane: string; identity: HerdrPaneIdentity; monitor: Promise<"closed" | "exited" | "idle" | "settled" | "aborted">; reporter: HerdrAgentReporter; closeRemote(): Promise<void>; close(): Promise<void> };
 type HerdrBreadcrumbIdentity = Omit<AgentIdentity, "structuralPath"> & { structuralPath?: readonly string[] };
 type CompletedSessionContext = { attempt?: { setup?: { cwd?: string } }; run?: { cwd?: string } };
 type HerdrAttemptActionContext = AgentAttemptActionContext | StandaloneAgentAttemptActionContext;
@@ -393,7 +396,7 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
       await closeResources().catch(() => undefined);
       throw error;
     }).finally(() => { signal.removeEventListener("abort", abortMonitor); });
-    return { pane: openedPane, monitor, reporter, closeRemote, close: async () => { monitorController.abort(); await monitor.then(() => undefined, () => undefined); } };
+    return { pane: openedPane, identity: herdrPaneIdentity(opened), monitor, reporter, closeRemote, close: async () => { monitorController.abort(); await monitor.then(() => undefined, () => undefined); } };
   } catch (error) {
     if (pane && !fullyInspectable) await runner(["pane", "close", pane]).catch(() => undefined);
     await bridge.close();
@@ -425,6 +428,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
       let disposed = false;
       const isDisposed = (): boolean => disposed;
       let sharedLaunch: Promise<PaneHandle> | undefined;
+      let paneIdentity: HerdrPaneIdentity | undefined;
       const beginLaunch = (prompt: string | undefined, retry = false): Promise<PaneHandle> => {
         if (isDisposed()) return Promise.reject(new Error("Herdr workflow session is disposed"));
         // Joined callers share the first launch; the executor normally serializes prompts, so later text is not sent separately.
@@ -432,7 +436,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
         const next = (async () => {
           try { return await suspendAndLaunch(prompt); }
           catch (error) { if (!retry || isDisposed()) throw error; return suspendAndLaunch(prompt); }
-        })();
+        })().then((pane) => { paneIdentity = pane.identity; return pane; });
         sharedLaunch = next;
         inFlight.add(next);
         void next.then(() => { inFlight.delete(next); if (sharedLaunch === next) sharedLaunch = undefined; }, () => { inFlight.delete(next); if (sharedLaunch === next) sharedLaunch = undefined; });
@@ -451,7 +455,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
       return {
         ...session,
         getLastAssistant(this: HerdrSession): WorkflowAgentMessage | undefined { return session.getLastAssistant?.call(this); },
-        reference: { ...session.reference, transport: "herdr" },
+        get reference(): WorkflowAgentSessionReference { return herdrSessionReference(session.reference, paneIdentity); },
         turnControlDelivered,
         async prompt(text) {
           if (disposed) throw new Error("Herdr workflow session is disposed");
@@ -461,6 +465,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
             current = pending ? await pending : await beginLaunch(text, true);
           }
           active = current;
+          paneIdentity = current.identity;
           let monitorFailed = false;
           let monitorError: unknown;
           let resumeFailed = false;

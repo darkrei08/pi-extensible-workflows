@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createHerdrAgentReporter, herdrPaneCommand, herdrPaneId, openHerdrPane, openHerdrWorkspacePane, waitForHerdrPane } from "../src/herdr.js";
+import { createHerdrAgentReporter, herdrPaneCommand, herdrPaneId, herdrPaneIdentity, herdrSessionReference, openHerdrPane, openHerdrWorkspacePane, waitForHerdrPane } from "../src/herdr.js";
 
 void test("gates Herdr actions on the managed pane environment", () => {
   assert.equal(herdrPaneId({ HERDR_ENV: "0", HERDR_PANE_ID: "pane" }), undefined);
@@ -298,4 +298,15 @@ void test("does not let status notifications suppress idle handback", async () =
     return JSON.stringify({ result: { agent: { agent_status: reports === 1 ? "working" : "idle" } } });
   };
   assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, onStatus: () => { throw new Error("notification failed"); } }), "idle");
+});
+
+void test("derives verified pane identity and keeps local references free of pane identity", () => {
+  assert.deepEqual(herdrPaneIdentity("pane-1"), { paneId: "pane-1" });
+  assert.deepEqual(herdrPaneIdentity({ workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1" }), { workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1" });
+  assert.throws(() => herdrPaneIdentity(""), /invalid created pane ID/);
+  const local = { transport: "local", sessionId: "session", locator: { sessionFile: "/sessions/session.jsonl" } };
+  assert.deepEqual(herdrSessionReference(local, undefined), { transport: "herdr", sessionId: "session", locator: { sessionFile: "/sessions/session.jsonl" } });
+  assert.deepEqual(herdrSessionReference(local, herdrPaneIdentity("pane-1")), { transport: "herdr", sessionId: "session", locator: { sessionFile: "/sessions/session.jsonl", herdr: { paneId: "pane-1" } } });
+  assert.deepEqual(herdrSessionReference({ transport: "local", sessionId: "session" }, herdrPaneIdentity({ workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1" })), { transport: "herdr", sessionId: "session", locator: { herdr: { workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1" } } });
+  assert.deepEqual(herdrSessionReference({ transport: "local", sessionId: "session", locator: "opaque" }, { paneId: "pane-1" }), { transport: "herdr", sessionId: "session", locator: "opaque" });
 });

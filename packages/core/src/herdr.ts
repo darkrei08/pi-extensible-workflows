@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { isObject } from "./utils.js";
+import type { WorkflowAgentSessionReference } from "./types.js";
 
 export type HerdrPaneAction = "live";
 export type HerdrAgentState = "idle" | "working" | "blocked" | "unknown";
@@ -8,7 +9,25 @@ export interface HerdrPaneStatus { state: HerdrAgentStatus }
 export interface HerdrPaneRequest { action: HerdrPaneAction; cwd: string; command: string; paneId?: string }
 export interface HerdrWorkspacePaneRequest { cwd: string; workspaceLabel?: string; workspaceId?: string; tabLabel: string; command: string }
 export interface HerdrWorkspacePane { workspaceId: string; tabId: string; paneId: string }
+export interface HerdrPaneIdentity { readonly paneId: string; readonly tabId?: string; readonly workspaceId?: string }
 export type HerdrCommandRunner = (args: readonly string[]) => Promise<string>;
+
+/** Only identity Herdr actually returned: a split pane has no tab or workspace identity of its own. */
+export function herdrPaneIdentity(pane: string | HerdrWorkspacePane): HerdrPaneIdentity {
+  if (typeof pane === "string") {
+    if (!pane) throw new Error("Herdr returned an invalid created pane ID.");
+    return { paneId: pane };
+  }
+  return { paneId: pane.paneId, ...(pane.tabId ? { tabId: pane.tabId } : {}), ...(pane.workspaceId ? { workspaceId: pane.workspaceId } : {}) };
+}
+
+export function herdrSessionReference(reference: WorkflowAgentSessionReference, identity: HerdrPaneIdentity | undefined): WorkflowAgentSessionReference {
+  const base: WorkflowAgentSessionReference = { ...reference, transport: "herdr" };
+  if (!identity) return base;
+  if (reference.locator === undefined) return { ...base, locator: { herdr: { ...identity } } };
+  if (!isObject(reference.locator)) return base;
+  return { ...base, locator: { ...reference.locator, herdr: { ...identity } } };
+}
 
 export const herdrCommandRunner: HerdrCommandRunner = (args) => new Promise<string>((resolve, reject) => {
   execFile("herdr", [...args], { encoding: "utf8", maxBuffer: 1024 * 1024 }, (error, stdout) => {

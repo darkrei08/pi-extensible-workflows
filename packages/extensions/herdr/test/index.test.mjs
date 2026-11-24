@@ -978,6 +978,7 @@ void test("routes fully inspectable agents into one labeled workflow workspace",
   const session = await agent.transport.createSession(prepared, { identity, attempt: 1, signal: new AbortController().signal });
   assert.equal(received, prepared);
   assert.equal(session.reference.transport, "herdr");
+  assert.deepEqual(session.reference.locator, { sessionFile, herdr: { workspaceId: "workspace", tabId: "tab-2", paneId: "pane-2" } });
   const firstLifecycle = await generatedBridge(runCommand);
   await firstLifecycle.handlers.get("agent_settled")?.({}, {});
   await session.prompt("continue");
@@ -1391,4 +1392,12 @@ void test("bridges a custom tool with a model supplied only by an inline extensi
     await session.dispose();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+void test("keeps the local transport and omits pane identity when Herdr is unavailable", () => {
+  const extension = createHerdrExtension({ agentDir: mkdtempSync(join(tmpdir(), "herdr-extension-unavailable-")), env: { HERDR_ENV: "1", HERDR_PANE_ID: "pane" } });
+  const localTransport = { id: "local" };
+  const agent = { transport: localTransport };
+  extension.agentSetupHooks.fullyInspectable.setup(agent, { identity: { structuralPath: ["review"], callSite: "agent", occurrence: 1 }, run: { runId: "run", workflow: { name: "flow" } }, signal: new AbortController().signal });
+  assert.equal(agent.transport, localTransport);
 });
